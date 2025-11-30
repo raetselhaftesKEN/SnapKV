@@ -1,3 +1,4 @@
+# python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path ablation_c4096_w32_k7_maxpool.json
 import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
@@ -282,6 +283,10 @@ if __name__ == '__main__':
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
     dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
+
+    # 减小maxlen，以免OOM
+    max_length = min(max_length, 16384)
+
     # predict on each dataset
     if not os.path.exists("pred"):
         os.makedirs("pred")
@@ -301,12 +306,12 @@ if __name__ == '__main__':
         compress_args = None
         write_model_name = model_name
     if args.e:
-        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test')
+        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test', trust_remote_code=True)
         if not os.path.exists(f"pred_e/{write_model_name}"):
             os.makedirs(f"pred_e/{write_model_name}")
         out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"
     else:
-        data = load_dataset('THUDM/LongBench', dataset, split='test')
+        data = load_dataset('THUDM/LongBench', dataset, split='test', trust_remote_code=True)
         if not os.path.exists(f"pred_e/{write_model_name}"):
             os.makedirs(f"pred_e/{write_model_name}")
         out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"

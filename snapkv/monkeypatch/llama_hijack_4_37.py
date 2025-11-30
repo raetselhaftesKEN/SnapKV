@@ -15,6 +15,12 @@ from snapkv.monkeypatch.snapkv_utils import init_snapkv
 
 logger = logging.get_logger(__name__)
 
+'''
+修改llama的注意力计算方式，以便适配snapKV
+'''
+
+
+
 # https://github.com/huggingface/transformers/blob/v4.37-release/src/transformers/models/llama/modeling_llama.py
 def llama_flash_attn2_forward(
     self,
@@ -26,8 +32,11 @@ def llama_flash_attn2_forward(
     use_cache: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
     # [SnapKV] register kv_cluster
+    # 加入snapKV
     init_snapkv(self)
+
     # LlamaFlashAttention2 attention does not support output_attentions
     if "padding_mask" in kwargs:
         warnings.warn(
@@ -41,6 +50,8 @@ def llama_flash_attn2_forward(
 
     bsz, q_len, _ = hidden_states.size()
 
+    # 这就是llama的源码，不用管
+    # q、k、v的计算
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
@@ -51,7 +62,11 @@ def llama_flash_attn2_forward(
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    
+
+    '''
+    这里开始修改：
+    本来这里是计算kv缓存序列的长度的
+    '''
     kv_seq_len = key_states.shape[-2]
     # if past_key_value is not None:
     #     kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -62,6 +77,10 @@ def llama_flash_attn2_forward(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
+
+        '''
+        这里加入snapKV，因为snapKV压缩了kv缓存，所以长度要重新计算
+        '''
         if hasattr(self, "kv_seq_len"): #[SnapKV] add kv_seq_len
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
@@ -70,22 +89,34 @@ def llama_flash_attn2_forward(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
+    # RoPE+kv头展开
     cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
     # [SnapKV] move to ahead
+    # SnapKV这里给他repeat复制到对其头数
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+    '''
+    最关键的部分：在写入kv缓存前调用snapKV
+    '''
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
         # key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         # print('kv_seq_len:', kv_seq_len)
         # print('key_states.shape:', key_states.shape)
+
+        '''
+        当key_states.shape[-2] == kv_seq_len，触发对序列进行压缩
+        用self.kv_cluster.update_kv压缩kv缓存
+        压缩后用past_key_value.update把压缩后的kv缓存写回
+        '''
         if key_states.shape[-2] == kv_seq_len: # [SnapKV] add kv_cluster
             self.kv_seq_len = kv_seq_len # [SnapKV] register kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
             past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
         else:
+            # 其他时候就直接加到缓存后面，这个应该也不用改
             self.kv_seq_len += q_len
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
@@ -135,6 +166,10 @@ def llama_flash_attn2_forward(
 
     return attn_output, attn_weights, past_key_value
 
+'''
+snapKV加的
+让生成循环可以正确使用压缩后的kv缓存，应该也不需要改，除非后面改了压缩方法跑不动了
+'''
 def prepare_inputs_for_generation_llama(
     self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
 ):

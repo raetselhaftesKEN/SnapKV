@@ -7,8 +7,8 @@ Hardware: 1 * A100-80GB (2 for `Mixtral`)
 
 example:
 
-```
-bash scripts/run_longbench.py
+```bash
+bash scripts/run_longbench.sh
 ```
 
 # Citation
