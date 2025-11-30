@@ -10,12 +10,6 @@ import argparse
 import torch
 from snapkv.monkeypatch.monkeypatch import replace_llama, replace_mistral, replace_mixtral
 
-# 强制离线模式
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
-
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None, choices=[
@@ -313,12 +307,12 @@ if __name__ == '__main__':
         compress_args = None
         write_model_name = model_name
     if args.e:
-        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test', trust_remote_code=True)
+        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test', trust_remote_code=True, local_files_only=True)
         if not os.path.exists(f"pred_e/{write_model_name}"):
             os.makedirs(f"pred_e/{write_model_name}")
         out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"
     else:
-        data = load_dataset('THUDM/LongBench', dataset, split='test', trust_remote_code=True)
+        data = load_dataset('THUDM/LongBench', dataset, split='test', trust_remote_code=True, local_files_only=True)
         if not os.path.exists(f"pred_e/{write_model_name}"):
             os.makedirs(f"pred_e/{write_model_name}")
         out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"
