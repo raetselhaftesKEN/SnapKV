@@ -9,6 +9,13 @@ import random
 import argparse
 import torch
 from snapkv.monkeypatch.monkeypatch import replace_llama, replace_mistral, replace_mixtral
+
+# 强制离线模式
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None, choices=[
