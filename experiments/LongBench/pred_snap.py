@@ -307,12 +307,12 @@ if __name__ == '__main__':
         compress_args = None
         write_model_name = model_name
     if args.e:
-        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test', trust_remote_code=True, local_files_only=True)
+        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test', trust_remote_code=True)
         if not os.path.exists(f"pred_e/{write_model_name}"):
             os.makedirs(f"pred_e/{write_model_name}")
         out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"
     else:
-        data = load_dataset('THUDM/LongBench', dataset, split='test', trust_remote_code=True, local_files_only=True)
+        data = load_dataset('THUDM/LongBench', dataset, split='test', trust_remote_code=True)
         if not os.path.exists(f"pred_e/{write_model_name}"):
             os.makedirs(f"pred_e/{write_model_name}")
         out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"
