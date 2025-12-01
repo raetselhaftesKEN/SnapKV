@@ -15,4 +15,4 @@ nohup python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path 
 
 nohup python pred_snap.py --model mistral-7B-instruct-v0.2 > 20251201nocompress.log 2>&1 &
 
-nohup python pred_snap_nokv.py --model mistral-7B-instruct-v0.2 > 20251201nokv.log 2>&1 &
+nohup python 1pred_snap_nokv.py --model mistral-7B-instruct-v0.2 > 20251201nokv.log 2>&1 &
