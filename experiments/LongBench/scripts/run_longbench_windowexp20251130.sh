@@ -6,3 +6,9 @@ nohup python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path 
 nohup python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path ablation_c4096_w32_k7_maxpool.json > 20251130w32.log 2>&1 &
 
 nohup python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path ablation_c4096_w64_k7_maxpool.json > 20251130w64.log 2>&1 &
+
+nohup python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path ablation_c1024_w32_k7_maxpool.json > 20251201c1024.log 2>&1 &
+
+nohup python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path ablation_c2048_w32_k7_maxpool.json > 20251201c2048.log 2>&1 &
+
+nohup python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path ablation_c512_w32_k7_maxpool.json > 20251201c2048.log 2>&1 &
