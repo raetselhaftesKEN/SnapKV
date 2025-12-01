@@ -138,9 +138,6 @@ def get_pred_single_gpu(data, max_length, max_gen,
             )[0]
         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
         pred = post_process(pred, model_name)
-        with open(out_path, "a", encoding="utf-8") as f:
-            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
-            f.write('\n')
 
         torch.cuda.synchronize()
         print(
@@ -148,6 +145,10 @@ def get_pred_single_gpu(data, max_length, max_gen,
             f"reserved={torch.cuda.memory_reserved() / 1024 ** 2:.1f}MB | "
             f"max_alloc={torch.cuda.max_memory_allocated() / 1024 ** 2:.1f}MB"
         )
+
+        with open(out_path, "a", encoding="utf-8") as f:
+            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
+            f.write('\n')
 
 
 def seed_everything(seed):
