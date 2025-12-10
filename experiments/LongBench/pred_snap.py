@@ -19,6 +19,7 @@ def parse_args(args=None):
     parser.add_argument('--compress_args_path', type=str, default=None, help="Path to the compress args")
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
     parser.add_argument('--dataset', type=str, default='qasper', help="Dataset to evaluate on")
+    parser.add_argument('--block_size', type=int, default=64, help="Comp. block size")
     return parser.parse_args(args)
 
 # This is the customized building prompt for chat models
@@ -74,7 +75,8 @@ def get_pred_single_gpu(data, max_length, max_gen,
                         window_sizes = None,
                         max_capacity_prompts = None,
                         kernel_sizes = None,
-                        pooling = None):
+                        pooling = None,
+                        block_size = 64):
     # device = torch.device(f'cuda:{rank}')
     # device = model.device
     model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device = "cuda", compress=compress)
@@ -97,6 +99,9 @@ def get_pred_single_gpu(data, max_length, max_gen,
                 model.model.layers[i].self_attn.config.max_capacity_prompt = max_capacity_prompts[i]
                 model.model.layers[i].self_attn.config.kernel_size = kernel_sizes[i]
                 model.model.layers[i].self_attn.config.pooling = pooling
+
+                # block size
+                model.model.layers[i].self_attn.config.block_size = block_size
         ############################################################################################################
         
         prompt = prompt_format.format(**json_obj)
@@ -278,6 +283,7 @@ if __name__ == '__main__':
     model_name = args.model
     # define your model
     max_length = model2maxlen[model_name]
+    block_size = args.block_size
     if args.e:
         datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", \
             "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
