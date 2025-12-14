@@ -39,6 +39,7 @@ dataset2metric = {
     "repobench-p": code_sim_score,
 }
 
+# python eval.py --model mistral-7B-instruct-v0.2
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None)
@@ -106,11 +107,13 @@ if __name__ == '__main__':
         # if dataset == 'qasper':
         #     scores[dataset + '_e'] = score_e
     if args.e:
-        out_path = f"H2O/results/{args.model}/result.json"
+        out_path = f"results/{args.model}"
     else:
-        out_path = f"H2O/results/{args.model}/result.json"
+        out_path = f"results/{args.model}"
         # out_path_e = f"pred/{args.model}/result_e.json"
         # with open(out_path_e, "w") as f:
         #     json.dump(score_e, f, ensure_ascii=False, indent=4)
-    with open(out_path, "w") as f:
+    if not os.path.exists(out_path):
+        os.makedirs(out_path)
+    with open(out_path+"/result.json", "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)
