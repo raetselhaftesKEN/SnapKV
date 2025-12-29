@@ -1,9 +1,29 @@
-import torch
-import math
-import torch.nn as nn
-import torch.nn.functional as F
 
-class SinkWindowKVCluster:
+import torch
+import time
+import torch.nn.functional as F
+import torch.nn as nn
+import math
+
+# perform qk calculation and get indices
+# this version will not update in inference mode
+
+# Copied from transformers.models.llama.modeling_llama.repeat_kv
+# 复制KV头，让KV头数和注意力对其（非核心，只是为了能跑）
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+# window_size：滑动窗口大小  max_capacity_prompt：做多缓存token数   kernel_size：对注意力得分池化的卷积核大小
+class SnapKVCluster():
     """
     对比基线：sink + sliding window
     - 保留最前面的 window_size 个 token（sink）
@@ -48,9 +68,8 @@ class SinkWindowKVCluster:
         value_states = torch.cat([v_sink, v_win], dim=2)
         return key_states, value_states
 
-
-# 注入逻辑：和你原来的 init_snapkv 保持一致，只是把 Cluster 换掉
-def init_sinkwindow(self):
+# 工具类，把snapKV注入注意力中，非核心算法，应该不用改
+def init_snapkv(self):
     if not hasattr(self, "kv_cluster"):
         if not hasattr(self.config, 'window_size'):
             self.config.window_size = 32
@@ -61,7 +80,7 @@ def init_sinkwindow(self):
         if not hasattr(self.config, 'pooling'):
             self.config.pooling = 'avgpool'
 
-    self.kv_cluster = SinkWindowKVCluster(
+    self.kv_cluster = SnapKVCluster(
         window_size=self.config.window_size,
         max_capacity_prompt=self.config.max_capacity_prompt,
         kernel_size=self.config.kernel_size,
