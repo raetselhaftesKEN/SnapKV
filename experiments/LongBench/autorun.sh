@@ -18,9 +18,10 @@ run_one () {
 }
 
 
-run_one "ablation_c512_w32_k7_maxpool.json"   "${DATE_TAG}c512w32sw.log"   || true
-run_one "ablation_c1024_w32_k7_maxpool.json"   "${DATE_TAG}c1024w32sw.log"   || true
-run_one "ablation_c2048_w32_k7_maxpool.json"   "${DATE_TAG}c2048w32sw.log"   || true
+run_one "ablation_c512_w32_k7_maxpool_sw.json"   "${DATE_TAG}c512w32sw.log"   || true
+run_one "ablation_c1024_w32_k7_maxpool_sw.json"   "${DATE_TAG}c1024w32sw.log"   || true
+run_one "ablation_c2048_w32_k7_maxpool_sw.json"   "${DATE_TAG}c2048w32sw.log"   || true
+run_one "ablation_c4096_w32_k7_maxpool_sw.json"   "${DATE_TAG}c4096w32sw.log"   || true
 
 
 echo "[$(date '+%F %T')] ALL DONE (continue-on-fail mode)"
