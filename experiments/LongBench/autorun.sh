@@ -2,7 +2,7 @@
 set -u
 
 CMD="python pred_snap.py --model mistral-7B-instruct-v0.2 --compress_args_path"
-DATE_TAG="20251221"
+DATE_TAG="20251224"
 
 run_one () {
   local json="$1"
@@ -17,12 +17,9 @@ run_one () {
   fi
 }
 
-run_one "ablation_c1024_w32_b16_k7_maxpool.json"   "${DATE_TAG}c1024w32b16.log"   || true
-run_one "ablation_c1024_w32_b32_k7_maxpool.json"   "${DATE_TAG}c1024w32b32.log"   || true
-run_one "ablation_c1024_w32_b64_k7_maxpool.json"   "${DATE_TAG}c1024w32b64.log"   || true
-run_one "ablation_c1024_w32_b128_k7_maxpool.json"  "${DATE_TAG}c1024w32b128.log"  || true
-run_one "ablation_c1024_w32_b256_k7_maxpool.json"  "${DATE_TAG}c1024w32b256.log"  || true
-run_one "ablation_c1024_w32_b512_k7_maxpool.json"  "${DATE_TAG}c1024w32b512.log"  || true
-run_one "ablation_c1024_w32_b1024_k7_maxpool.json" "${DATE_TAG}c1024w32b1024.log" || true
+
+run_one "ablation_c256_w32_k7_maxpool.json"   "${DATE_TAG}c256w32.log"   || true
+run_one "ablation_c128_w32_k7_maxpool.json"   "${DATE_TAG}c128w32.log"   || true
+
 
 echo "[$(date '+%F %T')] ALL DONE (continue-on-fail mode)"
