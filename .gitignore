@@ -163,3 +163,4 @@ experiments/LongBench/pred*
 experiments/LongBench/results
 experiments/LongBench/autorun*
 /.idea
+/cam-main
