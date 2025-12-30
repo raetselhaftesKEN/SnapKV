@@ -98,12 +98,12 @@ class SnapKVCluster:
         # 计算最近 window 的 query 对所有 key 的注意力分数
         # attn_logits: (bsz, heads, w, q_len)
         attn_logits = torch.matmul(
-            query_states[:, :, -w:, :],
+            query_states[:, :, -self.window_size:, :],
             key_states.transpose(2, 3)
         ) / math.sqrt(head_dim)
 
         # 仅对窗口内部做因果 mask（middle 都在窗口之前，不需要额外 mask）
-        attn_logits = self._apply_causal_mask_within_window(attn_logits, w)
+        attn_logits = self._apply_causal_mask_within_window(attn_logits, self.window_size)
 
         # softmax 得到注意力权重
         attn_probs = nn.functional.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
