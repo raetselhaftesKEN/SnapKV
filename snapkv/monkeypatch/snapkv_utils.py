@@ -21,120 +21,170 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-class SnapKVCluster:
+def _scatter_add_4d(dst, index, src):
     """
-    sink + window + merge-compensation:
-    - 保留最前 sink_size 个 token（sink）
-    - 保留最后 window_size 个 token（recent window）
-    - 中间被舍弃的 token：按“最近 window 对它们的注意力权重”做加权合并 => 1 个补偿 token（K/V 各一个向量）
-    - 最终顺序：[sink] + [comp] + [window]
-    - 默认把 comp token 算入 max_capacity_prompt 预算：sink_size = max_capacity_prompt - window_size - 1
+    dst:  [B, H, K, D]
+    index:[B, H, N]  each in [0, K-1]
+    src:  [B, H, N, D]
     """
-    def __init__(self, window_size=64, max_capacity_prompt=256+64, kernel_size=5, pooling='avgpool'):
-        self.window_size = window_size
-        self.max_capacity_prompt = max_capacity_prompt
-        self.kernel_size = kernel_size   # 保留字段以兼容 config
-        self.pooling = pooling           # 保留字段以兼容 config
+    B, H, K, D = dst.shape
+    # expand index to match last dim
+    index_exp = index.unsqueeze(-1).expand(B, H, index.shape[-1], D)  # [B,H,N,D]
+    return dst.scatter_add(2, index_exp, src)
 
-    def reset(self, window_size=64, max_capacity_prompt=256+64, kernel_size=5, pooling='avgpool'):
+
+def _scatter_add_3d(dst, index, src):
+    """
+    dst:  [B, H, K]
+    index:[B, H, N]
+    src:  [B, H, N]
+    """
+    return dst.scatter_add(2, index, src)
+
+
+def _merge_dropped_into_kept(
+    k_old: torch.Tensor,          # [B,H,L_old,D]
+    v_old: torch.Tensor,          # [B,H,L_old,D]
+    kept_indices: torch.Tensor,   # [B,H,K]  (topK positions in [0, L_old-1])
+    weights_m: torch.Tensor,      # [B,H,L_old]  importance mass for each old token
+    eps: float = 1e-6,
+    merge_k: bool = False,
+):
+    """
+    将所有 old token（包括 kept + dropped）按 key 相似度分配到 kept slots，
+    然后用 weights_m 做加权平均，得到每个 kept slot 的 merged V（以及可选 merged K）。
+
+    返回:
+      k_kept_out: [B,H,K,D]
+      v_kept_out: [B,H,K,D]
+    """
+    B, H, L_old, D = k_old.shape
+    K = kept_indices.shape[-1]
+
+    # 1) gather kept K/V 作为“代表点”
+    kept_idx_exp = kept_indices.unsqueeze(-1).expand(B, H, K, D)  # [B,H,K,D]
+    k_kept = k_old.gather(dim=2, index=kept_idx_exp)              # [B,H,K,D]
+    v_kept = v_old.gather(dim=2, index=kept_idx_exp)              # [B,H,K,D]
+
+    # 2) 对每个 old token 计算它与各 kept key 的相似度，选择最相似 kept slot
+    # sim: [B,H,L_old,K]
+    sim = torch.matmul(k_old, k_kept.transpose(-1, -2))  # dot product
+    assign = sim.argmax(dim=-1)                          # [B,H,L_old] in [0, K-1]
+
+    # 3) 以 weights_m 作为“注意力质量/重要性”做加权合并
+    m = weights_m.clamp_min(0.0)                         # [B,H,L_old]
+    m_unsq = m.unsqueeze(-1)                             # [B,H,L_old,1]
+
+    # numV[k] = sum_{t assigned->k} m_t * v_t
+    numV = torch.zeros((B, H, K, D), device=v_old.device, dtype=v_old.dtype)
+    numV = _scatter_add_4d(numV, assign, v_old * m_unsq)
+
+    # denom[k] = sum_{t assigned->k} m_t
+    denom = torch.zeros((B, H, K), device=v_old.device, dtype=v_old.dtype)
+    denom = _scatter_add_3d(denom, assign, m)
+
+    v_merged = numV / (denom.unsqueeze(-1) + eps)         # [B,H,K,D]
+
+    if not merge_k:
+        # 默认：不改 key，避免注意力定位漂移
+        return k_kept, v_merged
+
+    # 可选：也合并 key（更激进，可能更省信息但也更不稳定）
+    numK = torch.zeros((B, H, K, D), device=k_old.device, dtype=k_old.dtype)
+    numK = _scatter_add_4d(numK, assign, k_old * m_unsq)
+    k_merged = numK / (denom.unsqueeze(-1) + eps)
+
+    # 让 key 长度尺度别爆：可选做归一化（更像“方向平均”）
+    k_merged = F.normalize(k_merged, dim=-1)
+
+    return k_merged, v_merged
+
+
+class SnapKVCluster():
+    def __init__(self, window_size=64, max_capacity_prompt=256+64, kernel_size=5, pooling='avgpool',
+                 merge_dropped=True, merge_k=False):
         self.window_size = window_size
         self.max_capacity_prompt = max_capacity_prompt
+        assert self.max_capacity_prompt - self.window_size > 0
         self.kernel_size = kernel_size
         self.pooling = pooling
 
-    @staticmethod
-    def _apply_causal_mask_within_window(attn_weights, window_size):
-        """
-        仅对最后 window_size x window_size 的子块加因果 mask（与 SnapKV 思路一致）：
-        attn_weights: (bsz, heads, window_size, q_len)
-        """
-        device = attn_weights.device
-        dtype = attn_weights.dtype
-        # (w, w) 上三角为 -inf（禁止看未来）
-        mask = torch.full((window_size, window_size), torch.finfo(dtype).min, device=device)
-        mask_cond = torch.arange(window_size, device=device)
-        mask.masked_fill_(mask_cond < (mask_cond + 1).view(window_size, 1), 0)
-        attn_weights[:, :, -window_size:, -window_size:] += mask[None, None, :, :]
-        return attn_weights
+        # 新增：是否对 dropped tokens 做合并补偿
+        self.merge_dropped = merge_dropped
+        self.merge_k = merge_k  # 是否连 K 也合并（默认 False）
+
+    def reset(self, window_size=64, max_capacity_prompt=256+64, kernel_size=5, pooling='avgpool',
+              merge_dropped=True, merge_k=False):
+        self.__init__(window_size, max_capacity_prompt, kernel_size, pooling, merge_dropped, merge_k)
 
     def update_kv(self, key_states, query_states, value_states, attention_mask, num_key_value_groups):
-        # 形状一致性
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
 
-        # 缓存未满：不处理
         if q_len < self.max_capacity_prompt:
             return key_states, value_states
 
-        # 预算内保留 1 个补偿 token
-        comp_tokens = 1
-        sink_size = self.window_size
-        window_size = self.max_capacity_prompt - self.window_size - comp_tokens
-
-        # 切片边界：
-        # sink: [0, sink_size)
-        # middle(drop): [sink_size, q_len - w)
-        # window: [q_len - w, q_len)
-        mid_start = sink_size
-        mid_end = q_len - window_size
-        middle_len = max(0, mid_end - mid_start)
-
-        k_sink = key_states[:, :, :sink_size, :]
-        v_sink = value_states[:, :, :sink_size, :]
-        k_win  = key_states[:, :, -window_size:, :]
-        v_win  = value_states[:, :, -window_size:, :]
-
-        # 如果没有 middle token（比如 q_len 恰好接近预算），就退化为纯 sink+window（且不额外引入 comp）
-        if middle_len == 0:
-            # 这时为了不浪费预算，把 sink 放回 “不含 comp 的版本”
-            sink_size2 = self.max_capacity_prompt - self.window_size
-            if sink_size2 <= 0:
-                return k_win, v_win
-            k_sink2 = key_states[:, :, :sink_size2, :]
-            v_sink2 = value_states[:, :, :sink_size2, :]
-            return torch.cat([k_sink2, k_win], dim=2), torch.cat([v_sink2, v_win], dim=2)
-
-        # -------- 核心：middle token merging（注意力加权合并）--------
-        # 计算最近 window 的 query 对所有 key 的注意力分数
-        # attn_logits: (bsz, heads, w, q_len)
-        attn_logits = torch.matmul(
-            query_states[:, :, -self.window_size:, :],
+        # 1) 只用窗口 query 计算对全量 key 的注意力
+        attn_weights = torch.matmul(
+            query_states[..., -self.window_size:, :],
             key_states.transpose(2, 3)
         ) / math.sqrt(head_dim)
 
-        # 仅对窗口内部做因果 mask（middle 都在窗口之前，不需要额外 mask）
-        attn_logits = self._apply_causal_mask_within_window(attn_logits, self.window_size)
+        # 2) 窗口内部 causal mask
+        mask = torch.full((self.window_size, self.window_size),
+                          torch.finfo(attn_weights.dtype).min,
+                          device=attn_weights.device)
+        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        attention_mask_local = mask[None, None, :, :]
 
-        # softmax 得到注意力权重
-        attn_probs = nn.functional.softmax(attn_logits, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask_local
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-        # 将 window 内所有 query 对每个 key 的注意力求和，得到每个 token 的“重要性”
-        # token_scores: (bsz, heads, q_len)
-        token_scores = attn_probs.sum(dim=-2)
+        # 3) 旧 token 的注意力质量（mass）：m_t
+        # shape: [B,H,L_old] where L_old = q_len - window_size
+        attn_weights_sum = attn_weights[:, :, -self.window_size:, :-self.window_size].sum(dim=-2)
 
-        # 取 middle 区间的权重并归一化（每个 head 单独归一化）
-        mid_scores = token_scores[:, :, mid_start:mid_end]  # (bsz, heads, middle_len)
-        denom = mid_scores.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        mid_w = mid_scores / denom  # (bsz, heads, middle_len)
+        # 4) 平滑（与原 SnapKV 保持一致）
+        if self.pooling == 'avgpool':
+            attn_cache = F.avg_pool1d(attn_weights_sum, kernel_size=self.kernel_size,
+                                      padding=self.kernel_size//2, stride=1)
+        elif self.pooling == 'maxpool':
+            attn_cache = F.max_pool1d(attn_weights_sum, kernel_size=self.kernel_size,
+                                      padding=self.kernel_size//2, stride=1)
+        else:
+            raise ValueError('Pooling method not supported')
 
-        # 加权合并 K/V： (bsz, heads, middle_len, dim) * (bsz, heads, middle_len, 1)
-        k_mid = key_states[:, :, mid_start:mid_end, :]
-        v_mid = value_states[:, :, mid_start:mid_end, :]
-        mid_w_e = mid_w.unsqueeze(-1)  # (bsz, heads, middle_len, 1)
+        # 5) topK 选择（与原 SnapKV 完全一致）
+        K_keep = self.max_capacity_prompt - self.window_size
+        kept_pos = attn_cache.topk(K_keep, dim=-1).indices  # [B,H,K_keep] in [0, L_old-1]
 
-        k_comp = (k_mid * mid_w_e).sum(dim=2, keepdim=True)  # (bsz, heads, 1, dim)
-        v_comp = (v_mid * mid_w_e).sum(dim=2, keepdim=True)  # (bsz, heads, 1, dim)
+        # 6) 取出 old 与 cur
+        k_old = key_states[:, :, :-self.window_size, :]     # [B,H,L_old,D]
+        v_old = value_states[:, :, :-self.window_size, :]   # [B,H,L_old,D]
+        k_cur = key_states[:, :, -self.window_size:, :]
+        v_cur = value_states[:, :, -self.window_size:, :]
 
-        # 拼接：[sink] + [comp] + [window]
-        key_out = torch.cat([k_sink, k_comp, k_win], dim=2)
-        val_out = torch.cat([v_sink, v_comp, v_win], dim=2)
+        # 7) 合并补偿：把 dropped 的信息融合到 kept slots 的 V（可选也融合 K）
+        if self.merge_dropped:
+            # 可以在这里选择用 attn_cache 或 attn_weights_sum 做权重
+            # 建议默认用 attn_cache（平滑后更稳）
+            weights_m = attn_cache  # [B,H,L_old]
+            k_past_compress, v_past_compress = _merge_dropped_into_kept(
+                k_old, v_old, kept_pos, weights_m,
+                eps=1e-6,
+                merge_k=self.merge_k
+            )
+        else:
+            # 原版：直接 gather
+            kept_pos_exp = kept_pos.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+            k_past_compress = k_old.gather(dim=2, index=kept_pos_exp)
+            v_past_compress = v_old.gather(dim=2, index=kept_pos_exp)
 
-        # 保险：确保长度 == max_capacity_prompt（理论上应当成立）
-        if key_out.shape[2] > self.max_capacity_prompt:
-            key_out = key_out[:, :, -self.max_capacity_prompt:, :]
-            val_out = val_out[:, :, -self.max_capacity_prompt:, :]
-
-        return key_out, val_out
+        # 8) 拼接 topK(old) + window(cur)
+        key_states = torch.cat([k_past_compress, k_cur], dim=2)
+        value_states = torch.cat([v_past_compress, v_cur], dim=2)
+        return key_states, value_states
 
 
 # 工具类，把snapKV注入注意力中，非核心算法，应该不用改

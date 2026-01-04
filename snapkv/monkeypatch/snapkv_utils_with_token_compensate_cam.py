@@ -167,7 +167,7 @@ class SnapKVCluster():
 
         # 7) 合并补偿：把 dropped 的信息融合到 kept slots 的 V（可选也融合 K）
         if self.merge_dropped:
-            # 你可以在这里选择用 attn_cache 或 attn_weights_sum 做权重
+            # 可以在这里选择用 attn_cache 或 attn_weights_sum 做权重
             # 建议默认用 attn_cache（平滑后更稳）
             weights_m = attn_cache  # [B,H,L_old]
             k_past_compress, v_past_compress = _merge_dropped_into_kept(
