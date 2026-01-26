@@ -257,7 +257,7 @@ def init_snapkv(self):
             self.config.pooling = 'avgpool'
         # --- compensation defaults (can be overridden by your compress_args/config) ---
         if not hasattr(self.config, 'comp_enabled'):
-            self.config.comp_enabled = False
+            self.config.comp_enabled = True
         if not hasattr(self.config, 'comp_rff_dim'):
             self.config.comp_rff_dim = 128
         if not hasattr(self.config, 'comp_seed'):
