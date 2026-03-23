@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from datasets import load_from_disk, Dataset
+from datasets import load_from_disk, Dataset, load_dataset
 from transformers import (
     AutoTokenizer,
     AutoConfig,
@@ -587,7 +587,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -625,7 +625,11 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    dataset = load_from_disk(args.dataset_path)
+    if os.path.exists(args.dataset_path):
+        dataset = load_from_disk(args.dataset_path)
+    else:
+        dataset = load_dataset(args.dataset_path)
+
     if isinstance(dataset, Dataset):
         train_dataset = dataset
     elif "train" in dataset:
@@ -685,9 +689,9 @@ if __name__ == "__main__":
 '''
 
 python train_mistral_kv_vae_e2e.py \
-  --model_name_or_path /root/autodl-fs/models/Mistral-7B-Instruct-v0.2 \
-  --dataset_path /root/autodl-fs/datasets/fineweb-edu-tokenized \
-  --output_dir /root/autodl-fs/checkpoints/mistral_kv_vae_e2e \
+  --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
+  --dataset_path mikasenghaas/fineweb-edu-10bt-tokenized \
+  --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_vae_e2e \
   --kv_latent_size 64 \
   --vae_hidden_size 512 \
   --split_kv False \
