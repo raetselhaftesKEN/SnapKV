@@ -275,10 +275,15 @@ class MistralAttentionVAE(MistralAttention):
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         elif position_ids is not None:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            kv_seq_len = int(position_ids.max().item()) + 1
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         else:
             raise ValueError("Need either position_embeddings or position_ids for Mistral attention.")
 
@@ -346,10 +351,15 @@ class MistralAttentionVAE(MistralAttention):
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         elif position_ids is not None:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            kv_seq_len = int(position_ids.max().item()) + 1
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         else:
             raise ValueError("Need either position_embeddings or position_ids for Mistral attention.")
 
@@ -963,7 +973,7 @@ CUDA_LAUNCH_BLOCKING=1 python train_mistral_kv_vae_e2e_text.py \
   --dataset_config_name wikitext-103-raw-v1 \
   --dataset_split train \
   --text_column text \
-  --output_dir /path/to/mistral_kv_vae_e2e_wikitext \
+  --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_vae_e2e/mistral_kv_vae_e2e_wikitext \
   --kv_latent_size 64 \
   --vae_hidden_size 512 \
   --split_kv False \
@@ -988,7 +998,7 @@ CUDA_LAUNCH_BLOCKING=1 python train_mistral_kv_vae_e2e_text.py \
   --dataset_split train \
   --text_column text \
   --streaming True \
-  --output_dir /path/to/mistral_kv_vae_e2e_fineweb \
+  --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_vae_e2e/mistral_kv_vae_e2e_fineweb \
   --kv_latent_size 64 \
   --vae_hidden_size 512 \
   --split_kv False \
