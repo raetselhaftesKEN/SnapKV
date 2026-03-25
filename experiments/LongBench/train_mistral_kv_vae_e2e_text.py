@@ -181,7 +181,8 @@ def eager_mistral_attention(
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    #attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = F.softmax(attn_weights, dim=-1)
     attn_weights = F.dropout(attn_weights, p=dropout_p, training=training)
     attn_output = torch.matmul(attn_weights, value_states)
     return attn_output, attn_weights
@@ -450,8 +451,8 @@ class MistralForCausalLMVAE(MistralForCausalLM):
                 past_key_values=None,
                 inputs_embeds=inputs_embeds,
                 use_cache=False,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
+                output_attentions=False,
+                output_hidden_states=False,
                 return_dict=True,
                 **kwargs,
             )
@@ -812,10 +813,11 @@ def main():
     print(f"Total trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     print("============================")
 
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
+    #if args.gradient_checkpointing:
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
 
     train_dataset, approx_len, tokenized_mode = build_training_dataset(args, tokenizer)
 
@@ -989,7 +991,7 @@ CUDA_LAUNCH_BLOCKING=1 python train_mistral_kv_vae_e2e_text.py \
   --logging_steps 10 \
   --save_steps 500 \
   --bf16 True \
-  --max_length 2048 \
+  --max_length 768 \
   --max_steps 1000
 
 Example 2: FineWeb raw text streaming
