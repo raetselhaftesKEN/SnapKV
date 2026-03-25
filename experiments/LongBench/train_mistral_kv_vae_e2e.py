@@ -21,13 +21,14 @@ from typing import Optional, Union, Tuple, Dict, Any, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from datasets import load_from_disk, Dataset, load_dataset
 from transformers import (
     AutoTokenizer,
     AutoConfig,
-    TrainingArguments,
-    Trainer,
+    #TrainingArguments,
+    #Trainer,
     set_seed,
     default_data_collator,
 )
@@ -88,18 +89,23 @@ def get_trainable_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     return state
 
 
-class SaveTrainableOnlyTrainer(Trainer):
-    def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
-        os.makedirs(output_dir, exist_ok=True)
+def save_trainable_checkpoint(model, output_dir, step, extra_config=None):
+    ckpt_dir = os.path.join(output_dir, f"step_{step}")
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-        trainable_state = get_trainable_state_dict(self.model)
-        torch.save(trainable_state, os.path.join(output_dir, "trainable_vae_only.bin"))
+    trainable_state = {}
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            trainable_state[name] = param.detach().cpu()
 
-        if hasattr(self.model, "config") and self.model.config is not None:
-            self.model.config.save_pretrained(output_dir)
+    torch.save(trainable_state, os.path.join(ckpt_dir, "trainable_vae_only.bin"))
 
-        torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+    if hasattr(model, "config") and model.config is not None:
+        model.config.save_pretrained(ckpt_dir)
+
+    if extra_config is not None:
+        with open(os.path.join(ckpt_dir, "extra_vae_config.json"), "w", encoding="utf-8") as f:
+            json.dump(extra_config, f, ensure_ascii=False, indent=2)
 
 
 # =========================================================
@@ -694,50 +700,109 @@ def main():
         train_dataset = train_dataset.select(range(max_n))
         print(f"Using only the first {max_n} training samples.")
 
-    train_args = TrainingArguments(
-        output_dir=args.output_dir,
-        num_train_epochs=args.num_train_epochs,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        learning_rate=args.learning_rate,
-        warmup_ratio=args.warmup_ratio,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        save_total_limit=args.save_total_limit,
-        max_steps=args.max_steps,
-        max_grad_norm=args.max_grad_norm,
-        bf16=args.bf16,
-        fp16=args.fp16,
-        remove_unused_columns=False,
-        dataloader_num_workers=2,
-        dataloader_pin_memory=True,
-        gradient_checkpointing=args.gradient_checkpointing,
-        report_to="none",
-    )
 
-    '''
-    trainer = SaveTrainableOnlyTrainer(
-        model=model,
-        args=train_args,
-        train_dataset=train_dataset,
-        data_collator=default_data_collator,
-        tokenizer=tokenizer,
-    )'''
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.train()
 
-    trainer = SaveTrainableOnlyTrainer(
-        model=model,
-        args=train_args,
-        train_dataset=train_dataset,
-        data_collator=lambda features: dynamic_truncation_collator(
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.per_device_train_batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        collate_fn=lambda features: dynamic_truncation_collator(
             features,
             max_length=args.max_length if args.max_length > 0 else 10 ** 9,
             pad_token_id=tokenizer.pad_token_id,
         ),
-        tokenizer=tokenizer,
     )
 
-    trainer.train()
-    trainer.save_model(args.output_dir)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=args.learning_rate,
+        betas=(0.9, 0.999),
+        weight_decay=0.0,
+    )
+
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_steps > 0:
+        total_update_steps = args.max_steps
+        num_epochs = math.ceil(args.max_steps / num_update_steps_per_epoch)
+    else:
+        num_epochs = args.num_train_epochs
+        total_update_steps = num_epochs * num_update_steps_per_epoch
+
+    warmup_steps = int(total_update_steps * args.warmup_ratio)
+
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / max(1, warmup_steps)
+        return max(
+            0.0,
+            float(total_update_steps - current_step) / max(1, total_update_steps - warmup_steps)
+        )
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    use_autocast = args.bf16 or args.fp16
+    autocast_dtype = torch.bfloat16 if args.bf16 else torch.float16
+
+    global_step = 0
+    optimizer.zero_grad(set_to_none=True)
+
+    for epoch in range(num_epochs):
+        for step, batch in enumerate(train_dataloader):
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+
+            with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=use_autocast):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                    use_cache=False,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                loss = outputs.loss / args.gradient_accumulation_steps
+
+            loss.backward()
+
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+
+                if global_step % args.logging_steps == 0:
+                    lr = scheduler.get_last_lr()[0]
+                    print(
+                        f"[epoch {epoch + 1}] step={global_step} loss={loss.item() * args.gradient_accumulation_steps:.6f} lr={lr:.6e}")
+
+                if global_step % args.save_steps == 0:
+                    save_trainable_checkpoint(
+                        model,
+                        args.output_dir,
+                        global_step,
+                        extra_config=asdict(extra),
+                    )
+
+                if args.max_steps > 0 and global_step >= args.max_steps:
+                    break
+
+        if args.max_steps > 0 and global_step >= args.max_steps:
+            break
+
+    save_trainable_checkpoint(
+        model,
+        args.output_dir,
+        global_step,
+        extra_config=asdict(extra),
+    )
+    print("Training finished.")
 
     # extra save
     with open(os.path.join(args.output_dir, "extra_vae_config.json"), "w", encoding="utf-8") as f:
