@@ -300,10 +300,15 @@ class MistralAttentionVAE(MistralAttention):
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         elif position_ids is not None:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            kv_seq_len = int(position_ids.max().item()) + 1
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         else:
             raise ValueError("Need either position_embeddings or position_ids for Mistral attention.")
 
@@ -372,10 +377,15 @@ class MistralAttentionVAE(MistralAttention):
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         elif position_ids is not None:
-            cos, sin = self.rotary_emb(value_states, position_ids)
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            kv_seq_len = int(position_ids.max().item()) + 1
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
         else:
             raise ValueError("Need either position_embeddings or position_ids for Mistral attention.")
 
@@ -837,7 +847,10 @@ def main():
     print("============================")
 
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
@@ -997,8 +1010,8 @@ if __name__ == "__main__":
     main()
 
 """
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-python train_mistral_kv_vae_e2e_text.py \
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+python train_mistral_kv_vae_e2e_text_oomfix.py \
   --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
   --dataset_path Salesforce/wikitext \
   --dataset_config_name wikitext-103-raw-v1 \
