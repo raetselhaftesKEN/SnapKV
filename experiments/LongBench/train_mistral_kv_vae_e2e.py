@@ -16,7 +16,7 @@ import math
 import json
 import argparse
 from dataclasses import dataclass, asdict
-from typing import Optional, Union, Tuple, Dict, Any
+from typing import Optional, Union, Tuple, Dict, Any, List
 
 import torch
 import torch.nn as nn
@@ -568,6 +568,7 @@ def parse_args():
     parser.add_argument("--gradient_checkpointing", type=lambda x: str(x).lower() == "true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_length", type=int, default=-1)
+    parser.add_argument("--max_train_samples", type=int, default=-1)
 
     return parser.parse_args()
 
@@ -581,6 +582,49 @@ def truncate_example(example, max_length: int):
             out[k] = v
     return out
 
+def dynamic_truncation_collator(features: List[Dict[str, Any]], max_length: int, pad_token_id: int):
+    """
+    Dynamically truncate each sample in the batch to max_length, then pad to batch max length.
+    This avoids dataset.map(...) and therefore avoids writing a huge truncated Arrow cache to disk.
+    """
+    batch_input_ids = []
+    batch_attention_mask = []
+    batch_labels = []
+
+    for f in features:
+        input_ids = f["input_ids"][:max_length]
+        attention_mask = f.get("attention_mask", [1] * len(input_ids))[:max_length]
+
+        # labels default to input_ids for LM training
+        labels = f.get("labels", input_ids.copy())[:max_length]
+
+        batch_input_ids.append(torch.tensor(input_ids, dtype=torch.long))
+        batch_attention_mask.append(torch.tensor(attention_mask, dtype=torch.long))
+        batch_labels.append(torch.tensor(labels, dtype=torch.long))
+
+    max_len_in_batch = max(x.size(0) for x in batch_input_ids)
+
+    padded_input_ids = []
+    padded_attention_mask = []
+    padded_labels = []
+
+    for input_ids, attention_mask, labels in zip(batch_input_ids, batch_attention_mask, batch_labels):
+        pad_len = max_len_in_batch - input_ids.size(0)
+
+        if pad_len > 0:
+            input_ids = F.pad(input_ids, (0, pad_len), value=pad_token_id)
+            attention_mask = F.pad(attention_mask, (0, pad_len), value=0)
+            labels = F.pad(labels, (0, pad_len), value=-100)
+
+        padded_input_ids.append(input_ids)
+        padded_attention_mask.append(attention_mask)
+        padded_labels.append(labels)
+
+    return {
+        "input_ids": torch.stack(padded_input_ids, dim=0),
+        "attention_mask": torch.stack(padded_attention_mask, dim=0),
+        "labels": torch.stack(padded_labels, dim=0),
+    }
 
 def main():
     args = parse_args()
@@ -637,12 +681,18 @@ def main():
     else:
         raise ValueError("Dataset must be a Dataset or a DatasetDict with 'train' split.")
 
+    '''
     if args.max_length > 0:
         train_dataset = train_dataset.map(
             lambda x: truncate_example(x, args.max_length),
             num_proc=4,
             desc=f"truncate_to_{args.max_length}",
         )
+    '''
+    if args.max_train_samples > 0:
+        max_n = min(args.max_train_samples, len(train_dataset))
+        train_dataset = train_dataset.select(range(max_n))
+        print(f"Using only the first {max_n} training samples.")
 
     train_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -665,11 +715,24 @@ def main():
         report_to="none",
     )
 
+    '''
     trainer = SaveTrainableOnlyTrainer(
         model=model,
         args=train_args,
         train_dataset=train_dataset,
         data_collator=default_data_collator,
+        tokenizer=tokenizer,
+    )'''
+
+    trainer = SaveTrainableOnlyTrainer(
+        model=model,
+        args=train_args,
+        train_dataset=train_dataset,
+        data_collator=lambda features: dynamic_truncation_collator(
+            features,
+            max_length=args.max_length if args.max_length > 0 else 10 ** 9,
+            pad_token_id=tokenizer.pad_token_id,
+        ),
         tokenizer=tokenizer,
     )
 
@@ -708,5 +771,28 @@ python train_mistral_kv_vae_e2e.py \
   --save_steps 500 \
   --bf16 True \
   --max_length 2048
+  
+  
+python train_mistral_kv_vae_e2e.py \
+  --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
+  --dataset_path mikasenghaas/fineweb-edu-10bt-tokenized \
+  --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_vae_e2e \
+  --kv_latent_size 64 \
+  --vae_hidden_size 512 \
+  --split_kv False \
+  --kl_weight 1e-5 \
+  --rec_weight 1.0 \
+  --ntp_weight 1.0 \
+  --sample_during_train True \
+  --num_train_epochs 1 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 2e-4 \
+  --warmup_ratio 0.03 \
+  --logging_steps 10 \
+  --save_steps 500 \
+  --bf16 True \
+  --max_length 2048 \
+  --max_train_samples 10000
   
 '''
