@@ -201,6 +201,7 @@ class MistralAttentionVAE(MistralAttention):
         self.split_kv = getattr(config, "split_kv", False)
         self.sample_during_train = getattr(config, "sample_during_train", True)
         self.deterministic_eval = getattr(config, "deterministic_eval", True)
+        self.scaling = self.head_dim ** -0.5
 
         kv_dim = self.num_key_value_heads * self.head_dim
 
