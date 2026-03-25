@@ -546,6 +546,8 @@ def parse_args():
     # paths
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--dataset_path", type=str, required=True)
+    parser.add_argument("--dataset_config_name", type=str, default=None)
+    parser.add_argument("--text_column", type=str, default="text")
     parser.add_argument("--output_dir", type=str, required=True)
 
     # vae
@@ -632,6 +634,13 @@ def dynamic_truncation_collator(features: List[Dict[str, Any]], max_length: int,
         "labels": torch.stack(padded_labels, dim=0),
     }
 
+def tokenize_fn(examples):
+    return tokenizer(
+        examples[args.text_column],
+        add_special_tokens=True,
+        truncation=False,
+    )
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -675,11 +684,14 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    if os.path.exists(args.dataset_path):
-        dataset = load_from_disk(args.dataset_path)
-    else:
-        dataset = load_dataset(args.dataset_path)
+    raw_ds = load_dataset(
+        args.dataset_path,
+        args.dataset_config_name,
+        split="train",
+    )
 
+
+    '''
     if isinstance(dataset, Dataset):
         train_dataset = dataset
     elif "train" in dataset:
@@ -687,7 +699,7 @@ def main():
     else:
         raise ValueError("Dataset must be a Dataset or a DatasetDict with 'train' split.")
 
-    '''
+    
     if args.max_length > 0:
         train_dataset = train_dataset.map(
             lambda x: truncate_example(x, args.max_length),
@@ -696,8 +708,8 @@ def main():
         )
     '''
     if args.max_train_samples > 0:
-        max_n = min(args.max_train_samples, len(train_dataset))
-        train_dataset = train_dataset.select(range(max_n))
+        max_n = min(args.max_train_samples, len(raw_ds))
+        train_dataset = raw_ds.select(range(max_n))
         print(f"Using only the first {max_n} training samples.")
 
 
@@ -840,7 +852,9 @@ python train_mistral_kv_vae_e2e.py \
   
 python train_mistral_kv_vae_e2e.py \
   --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
-  --dataset_path mikasenghaas/fineweb-edu-10bt-tokenized \
+  --dataset_path Salesforce/wikitext \
+  --dataset_config_name wikitext-103-raw-v1 \
+  --text_column text \
   --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_vae_e2e \
   --kv_latent_size 64 \
   --vae_hidden_size 512 \
