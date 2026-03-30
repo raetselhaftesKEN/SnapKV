@@ -56,6 +56,7 @@ nohup python train_mistral_kv_vae_e2e_text_oomfix_mu_logvar.py \
   --latent_hist_save_steps 100 \
   --latent_hist_max_points 4096 \
   --latent_hist_dirname latent_stats
+  > "${LOG_FILE}" 2>&1 &
 
 echo $! > "${PID_FILE}"
 
