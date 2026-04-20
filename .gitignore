@@ -159,7 +159,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 notebooks/test*
-experiments/LongBench/pred*
+experiments/LongBench/pred_e
 experiments/LongBench/results
 experiments/LongBench/autorun*
 /.idea
