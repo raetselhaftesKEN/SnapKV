@@ -435,4 +435,6 @@ python analyze_latent_stats.py \
   
 python analyze_latent_stats.py --latent_dir ./mistral_kv_vae_e2e_wikitext_20260330/latent_stats   --out_dir ./latent_analysis_20260330   --log_file ./train_mistral_kv_vae_e2e_20260330.log
   
+  
+python analyze_latent_stats.py --latent_dir ./mistral_kv_predictor_friendly/latent_stats   --out_dir ./latent_analysis_20260407   --log_file ./mistral_kv_predictor_friendly/train_mistral_kv_vae_e2e_20260407.log
 ''' 
