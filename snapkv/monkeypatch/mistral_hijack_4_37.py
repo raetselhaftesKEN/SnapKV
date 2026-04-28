@@ -23,145 +23,6 @@ if is_flash_attn_2_available():
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
 
-def _gather_tokens(x: torch.Tensor, token_idx: torch.Tensor) -> torch.Tensor:
-    # x: [B, H, T, D], token_idx: [B, K]
-    return x.gather(2, token_idx[:, None, :, None].expand(-1, x.size(1), -1, x.size(3)))
-
-
-def _apply_rope_to_k_only(key_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-    dummy_q = torch.zeros_like(key_states)
-    _, k_out = apply_rotary_pos_emb(dummy_q, key_states, cos, sin, position_ids)
-    return k_out
-
-
-def _compress_dropped_to_latent(attn_module, dropped_k_pre: torch.Tensor, dropped_v_pre: torch.Tensor):
-    """
-    dropped_k_pre/dropped_v_pre: [B, num_kv_heads, Tdrop, Hd]
-    返回 latent mu: [B, Tdrop, latent_dim]
-    """
-    bsz, num_kv_heads, seq_len, head_dim = dropped_k_pre.shape
-    k_flat = dropped_k_pre.transpose(1, 2).contiguous().reshape(bsz, seq_len, num_kv_heads * head_dim)
-    v_flat = dropped_v_pre.transpose(1, 2).contiguous().reshape(bsz, seq_len, num_kv_heads * head_dim)
-    kv = torch.cat([k_flat, v_flat], dim=-1)
-
-    with torch.no_grad():
-        mu, logvar = attn_module.kv_vae.encode(kv)
-
-    return mu
-
-
-def _restore_dropped_from_latent(attn_module, latent: torch.Tensor, num_kv_heads: int, head_dim: int):
-    """
-    latent: [B, Tdrop, latent_dim]
-    返回 pre-RoPE unrepeated KV:
-      recon_k_pre / recon_v_pre: [B, num_kv_heads, Tdrop, Hd]
-    """
-    with torch.no_grad():
-        recon_kv = attn_module.kv_vae.decode(latent)
-
-    recon_k_flat, recon_v_flat = torch.split(recon_kv, num_kv_heads * head_dim, dim=-1)
-    bsz, seq_len, _ = recon_k_flat.shape
-
-    recon_k = recon_k_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
-    recon_v = recon_v_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
-    return recon_k, recon_v
-
-# 新增 hybrid cache 构建函数
-def _maybe_build_hybrid_cache(
-    attn_module,
-    key_states_pre: torch.Tensor,
-    value_states_pre: torch.Tensor,
-    key_states_rep_postrope: torch.Tensor,
-    query_states_rep_postrope: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: torch.Tensor,
-):
-    """
-    prefix 阶段：
-      - keep 的 token 以全精度 KV 存入 normal cache
-      - dropped 的 token 只存 latent(mu) + positions
-    """
-    init_kv_vae_for_mistral_attn(attn_module)
-    if not getattr(attn_module, 'use_kv_vae_cache', False):
-        return None, None, False
-
-    keep_idx, drop_idx = attn_module.kv_cluster.select_important_tokens(
-        key_states_rep_postrope, query_states_rep_postrope
-    )
-    if keep_idx is None:
-        return None, None, False
-
-    bsz, num_kv_heads, q_len, head_dim = key_states_pre.shape
-    window = attn_module.kv_cluster.window_size
-    old_len = q_len - window
-    device = key_states_pre.device
-
-    # kept old tokens + current window
-    keep_old_k_pre = _gather_tokens(key_states_pre[:, :, :old_len, :], keep_idx)
-    keep_old_v_pre = _gather_tokens(value_states_pre[:, :, :old_len, :], keep_idx)
-    cur_k_pre = key_states_pre[:, :, -window:, :]
-    cur_v_pre = value_states_pre[:, :, -window:, :]
-
-    kept_k_pre = torch.cat([keep_old_k_pre, cur_k_pre], dim=2)
-    kept_v_pre = torch.cat([keep_old_v_pre, cur_v_pre], dim=2)
-
-    keep_pos = torch.cat([
-        keep_idx,
-        torch.arange(old_len, q_len, device=device).unsqueeze(0).expand(bsz, -1)
-    ], dim=1)
-
-    kept_k_post = _apply_rope_to_k_only(kept_k_pre, cos, sin, keep_pos)
-    kept_v_post = kept_v_pre
-
-    kept_k_rep = repeat_kv(kept_k_post, attn_module.num_key_value_groups)
-    kept_v_rep = repeat_kv(kept_v_post, attn_module.num_key_value_groups)
-
-    # dropped old tokens -> latent only
-    if drop_idx.size(1) > 0:
-        drop_k_pre = _gather_tokens(key_states_pre[:, :, :old_len, :], drop_idx)
-        drop_v_pre = _gather_tokens(value_states_pre[:, :, :old_len, :], drop_idx)
-
-        latent = _compress_dropped_to_latent(attn_module, drop_k_pre, drop_v_pre)
-
-        attn_module.kv_cluster.store_vae_compressed(
-            latent=latent,
-            positions=drop_idx,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            group_size=attn_module.num_key_value_groups,
-        )
-    else:
-        attn_module.kv_cluster.clear_vae_cache()
-
-    return kept_k_rep, kept_v_rep, True
-
-# 新增 decode 恢复函数
-def _maybe_restore_dropped_cache(attn_module, cos, sin):
-    init_kv_vae_for_mistral_attn(attn_module)
-    if not getattr(attn_module, 'use_kv_vae_cache', False):
-        return None, None
-    if not attn_module.kv_cluster.has_vae_cache():
-        return None, None
-
-    latent = attn_module.kv_cluster.vae_dropped_latent.to(
-        device=attn_module.q_proj.weight.device,
-        dtype=attn_module.q_proj.weight.dtype
-    )
-    drop_pos = attn_module.kv_cluster.vae_dropped_positions.to(device=attn_module.q_proj.weight.device)
-    num_kv_heads = attn_module.kv_cluster.vae_num_kv_heads
-    head_dim = attn_module.kv_cluster.vae_head_dim
-
-    recon_k_pre, recon_v_pre = _restore_dropped_from_latent(attn_module, latent, num_kv_heads, head_dim)
-
-    recon_k_post = _apply_rope_to_k_only(recon_k_pre, cos, sin, drop_pos)
-    recon_v_post = recon_v_pre
-
-    recon_k_rep = repeat_kv(recon_k_post, attn_module.num_key_value_groups)
-    recon_v_rep = repeat_kv(recon_v_post, attn_module.num_key_value_groups)
-
-    return recon_k_rep, recon_v_rep
-
 
 # ============================================================
 # Predictor-friendly KV-VAE inference helpers
@@ -412,9 +273,7 @@ def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: 
 
     return recon_k, recon_v
 
-# dropped token 不丢，而是存 latent(mu) + 原始位置
-# prefix 阶段构建 hybrid cache
-# decode 阶段恢复 dropped latent 并拼接回 attention
+
 def mistral_flash_attn2_forward(
     self,
     hidden_states: torch.Tensor,
@@ -439,12 +298,17 @@ def mistral_flash_attn2_forward(
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    # pre-RoPE, unrepeated
     query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states_pre = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states_pre = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    kv_seq_len = key_states_pre.shape[-2]
+    # ------------------------------------------------------------
+    # [KV-VAE] compress + decompress all pre-RoPE KV once
+    # This exactly matches the training target domain: pre-RoPE flattened KV.
+    # ------------------------------------------------------------
+    key_states, value_states = apply_kv_vae_if_needed(self, key_states, value_states, q_len)
+
+    kv_seq_len = key_states.shape[-2]
     if past_key_value is not None:
         if self.layer_idx is None:
             raise ValueError(
@@ -461,10 +325,8 @@ def mistral_flash_attn2_forward(
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
     rotary_seq_len = max(kv_seq_len, position_ids[:, -1].max().item()) + 1
-    cos, sin = self.rotary_emb(value_states_pre, seq_len=rotary_seq_len)
-
-    # 当前 query / current prefix attention 仍然使用原始当前 KV
-    query_states, key_states_post = apply_rotary_pos_emb(query_states, key_states_pre, cos, sin, position_ids)
+    cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
     use_sliding_windows = (
         _flash_supports_window_size
@@ -478,8 +340,8 @@ def mistral_flash_attn2_forward(
             ' make sure to upgrade flash-attn library.'
         )
 
-    key_states_rep = repeat_kv(key_states_post, self.num_key_value_groups)
-    value_states_rep = repeat_kv(value_states_pre, self.num_key_value_groups)
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     if past_key_value is not None:
         cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
@@ -489,8 +351,10 @@ def mistral_flash_attn2_forward(
             and cache_has_contents
         ):
             slicing_tokens = 1 - self.config.sliding_window
+
             past_key = past_key_value[self.layer_idx][0]
             past_value = past_key_value[self.layer_idx][1]
+
             past_key = past_key[:, :, slicing_tokens:, :].contiguous()
             past_value = past_value[:, :, slicing_tokens:, :].contiguous()
 
@@ -504,41 +368,15 @@ def mistral_flash_attn2_forward(
                 attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
 
         cache_kwargs = {'sin': sin, 'cos': cos}
-
-        # prefix phase
-        if key_states_rep.shape[-2] >= kv_seq_len:
+        if key_states.shape[-2] >= kv_seq_len:
             self.kv_seq_len = kv_seq_len
-
-            hybrid_k, hybrid_v, used_hybrid = _maybe_build_hybrid_cache(
-                self,
-                key_states_pre=key_states_pre,
-                value_states_pre=value_states_pre,
-                key_states_rep_postrope=key_states_rep,
-                query_states_rep_postrope=query_states,
-                cos=cos,
-                sin=sin,
-                position_ids=position_ids,
+            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                key_states, query_states, value_states, attention_mask, self.num_key_value_groups
             )
-
-            if used_hybrid:
-                past_key_value.update(hybrid_k, hybrid_v, self.layer_idx, cache_kwargs)
-            else:
-                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                    key_states_rep, query_states, value_states_rep, attention_mask, self.num_key_value_groups
-                )
-                past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
-
-        # decode phase
+            past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
         else:
             self.kv_seq_len += q_len
-            key_states_rep, value_states_rep = past_key_value.update(
-                key_states_rep, value_states_rep, self.layer_idx, cache_kwargs
-            )
-
-            restored_k, restored_v = _maybe_restore_dropped_cache(self, cos, sin)
-            if restored_k is not None and restored_v is not None:
-                key_states_rep = torch.cat([key_states_rep, restored_k], dim=2)
-                value_states_rep = torch.cat([value_states_rep, restored_v], dim=2)
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     dropout_rate = 0.0 if not self.training else self.attention_dropout
 
@@ -553,12 +391,12 @@ def mistral_flash_attn2_forward(
             f"The input hidden states seems to be silently casted in float32. We will cast back the input in {target_dtype}."
         )
         query_states = query_states.to(target_dtype)
-        key_states_rep = key_states_rep.to(target_dtype)
-        value_states_rep = value_states_rep.to(target_dtype)
+        key_states = key_states.to(target_dtype)
+        value_states = value_states.to(target_dtype)
 
     query_states = query_states.transpose(1, 2)
-    key_states = key_states_rep.transpose(1, 2)
-    value_states = value_states_rep.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
 
     attn_output = self._flash_attention_forward(
         query_states,
@@ -570,6 +408,48 @@ def mistral_flash_attn2_forward(
         use_sliding_windows=use_sliding_windows,
     )
 
+    # keep original compensation logic
+    try:
+        comp_ok = (
+            past_key_value is not None
+            and getattr(self, 'kv_cluster', None) is not None
+            and getattr(self.kv_cluster, 'comp_enabled', False)
+            and getattr(self.kv_cluster, '_comp_inited', False)
+            and q_len == 1
+        )
+    except Exception:
+        comp_ok = False
+
+    if comp_ok:
+        query_states_bhld = query_states.transpose(1, 2)
+        key_states_bhkd = key_states.transpose(1, 2)
+
+        q_bhld = query_states_bhld.to(torch.float32)
+        k_bhkd = key_states_bhkd.to(torch.float32)
+        logits = torch.matmul(q_bhld, k_bhkd.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:
+            if attention_mask.dim() == 2:
+                key_mask = attention_mask[:, None, None, :].to(torch.float32)
+                logits = logits + (1.0 - key_mask) * torch.finfo(logits.dtype).min
+            elif attention_mask.dim() == 4:
+                logits = logits + attention_mask.to(logits.dtype)
+
+        m = logits.max(dim=-1).values
+        exp_logits = torch.exp(logits - m.unsqueeze(-1))
+        Z_Cs = exp_logits.sum(dim=-1)
+        O_C = attn_output.permute(0, 2, 1, 3).to(torch.float32)
+        N_Cs = Z_Cs.unsqueeze(-1) * O_C
+
+        Z_D_raw, N_D_raw = self.kv_cluster.comp_terms(query_states_bhld)
+        if (Z_D_raw is not None) and (N_D_raw is not None):
+            scale = torch.exp(-m)
+            Z_Ds = scale * Z_D_raw.to(torch.float32)
+            N_Ds = scale.unsqueeze(-1) * N_D_raw.to(torch.float32)
+            denom = (Z_Cs + Z_Ds).clamp_min(1e-6)
+            O_hat = (N_Cs + N_Ds) / denom.unsqueeze(-1)
+            attn_output = O_hat.permute(0, 2, 1, 3).to(attn_output.dtype)
+
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
     attn_output = self.o_proj(attn_output)
 
@@ -578,14 +458,11 @@ def mistral_flash_attn2_forward(
 
     return attn_output, attn_weights, past_key_value
 
+
 def prepare_inputs_for_generation_mistral(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
     if past_key_values is None:
         for layer in self.model.layers:
             layer.self_attn.kv_seq_len = 0
-
-            # new：把latent cache也清除掉
-            if hasattr(layer.self_attn, "kv_cluster"):
-                layer.self_attn.kv_cluster.clear_vae_cache()
     if past_key_values is not None:
         if isinstance(past_key_values, Cache):
             cache_length = past_key_values.get_seq_length()
