@@ -20,7 +20,7 @@ logger = logging.get_logger(__name__)
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
 
 
@@ -29,8 +29,8 @@ if is_flash_attn_2_available():
 # ============================================================
 class InferenceTokenVAE(nn.Module):
     """
-    Inference-only mirror of train_mistral_kv_latent_predictor_friendly.py
-    We only need deterministic encode(mu) + decode(mu) by default.
+    Inference-only mirror of predictor-friendly training VAE.
+    Default inference is deterministic: z = mu
     """
     def __init__(self, input_dim: int, latent_dim: int, hidden_dim: int, logvar_min: float = -4.0, logvar_max: float = 1.0):
         super().__init__()
@@ -40,6 +40,7 @@ class InferenceTokenVAE(nn.Module):
         self.logvar_min = logvar_min
         self.logvar_max = logvar_max
 
+        # encoder
         self.in_proj = nn.Linear(input_dim, hidden_dim)
         self.enc_fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.enc_fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -48,6 +49,7 @@ class InferenceTokenVAE(nn.Module):
         self.mu_proj = nn.Linear(hidden_dim, latent_dim)
         self.logvar_proj = nn.Linear(hidden_dim, latent_dim)
 
+        # decoder
         self.dec_in = nn.Linear(latent_dim, hidden_dim)
         self.dec_fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.dec_fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -94,7 +96,7 @@ class InferenceTokenVAE(nn.Module):
 class SharedInferenceVAEPool(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.group_size = int(getattr(config, 'vae_group_size', 4))
+        self.group_size = int(getattr(config, "vae_group_size", 4))
         self.num_layers = int(config.num_hidden_layers)
         self.num_groups = math.ceil(self.num_layers / self.group_size)
 
@@ -104,10 +106,10 @@ class SharedInferenceVAEPool(nn.Module):
         self.group_vaes = nn.ModuleList([
             InferenceTokenVAE(
                 input_dim=input_dim,
-                latent_dim=int(getattr(config, 'kv_latent_size', 32)),
-                hidden_dim=int(getattr(config, 'vae_hidden_size', 256)),
-                logvar_min=float(getattr(config, 'logvar_min', -4.0)),
-                logvar_max=float(getattr(config, 'logvar_max', 1.0)),
+                latent_dim=int(getattr(config, "kv_latent_size", 32)),
+                hidden_dim=int(getattr(config, "vae_hidden_size", 256)),
+                logvar_min=float(getattr(config, "logvar_min", -4.0)),
+                logvar_max=float(getattr(config, "logvar_max", 1.0)),
             )
             for _ in range(self.num_groups)
         ])
@@ -122,58 +124,88 @@ def _strip_prefix_if_present(state_dict: Dict[str, torch.Tensor], prefix: str) -
     return {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
 
 
-def _load_vae_group_state(vae_module: nn.Module, full_state: Dict[str, torch.Tensor], layer_idx: int, group_idx: int):
+def _load_vae_group_state(
+    vae_module: nn.Module,
+    full_state: Dict[str, torch.Tensor],
+    layer_idx: int,
+    group_idx: int,
+    group_size: int = 4,
+):
+    """
+    Robust loader for shared-vae checkpoints.
+
+    For share_vae_across_layers=True, PyTorch often only saves one canonical path
+    for the shared module. So for group 0, even layer 1/2/3 may need to load from:
+      model.layers.0.self_attn.kv_vae.*
+    """
+    group_start_layer = group_idx * group_size
+
     candidates = [
+        # shared-pool style naming
         f"model.shared_vae_pool.group_vaes.{group_idx}.",
         f"shared_vae_pool.group_vaes.{group_idx}.",
+
+        # exact current layer naming
         f"model.layers.{layer_idx}.self_attn.kv_vae.",
         f"layers.{layer_idx}.self_attn.kv_vae.",
+
+        # representative layer naming for this shared group
+        f"model.layers.{group_start_layer}.self_attn.kv_vae.",
+        f"layers.{group_start_layer}.self_attn.kv_vae.",
     ]
+
     loaded = False
     for prefix in candidates:
         sub = _strip_prefix_if_present(full_state, prefix)
         if sub:
             missing, unexpected = vae_module.load_state_dict(sub, strict=False)
-            logger.info(f"Loaded VAE weights for layer={layer_idx}, group={group_idx} from prefix='{prefix}', missing={len(missing)}, unexpected={len(unexpected)}")
+            logger.info(
+                f"Loaded VAE weights for layer={layer_idx}, group={group_idx} "
+                f"from prefix='{prefix}', missing={len(missing)}, unexpected={len(unexpected)}"
+            )
             loaded = True
             break
+
     if not loaded:
+        preview_keys = list(full_state.keys())[:50]
         raise KeyError(
             f"Could not find VAE weights for layer {layer_idx} / group {group_idx}. "
-            f"Tried prefixes: {candidates[:]}"
+            f"Tried prefixes: {candidates}. "
+            f"First checkpoint keys: {preview_keys}"
         )
 
 
 def init_kv_vae_for_mistral_attn(self):
     """
-    Lazy init on the attention module itself.
+    Lazy init on each attention module.
 
     Required config fields:
-      config.vae_ckpt_path: path to trainable_vae_only.bin or checkpoint dir containing it
+      config.use_kv_vae: bool
+      config.vae_ckpt_path: checkpoint dir or trainable_vae_only.bin
 
     Optional config fields:
-      config.use_kv_vae: bool, default False
       config.kv_vae_deterministic: bool, default True
+      config.kv_vae_apply_on_decode_only: bool, default False
       config.share_vae_across_layers: bool, default True
       config.vae_group_size: int, default 4
       config.kv_latent_size, config.vae_hidden_size, config.logvar_min, config.logvar_max
-      config.kv_vae_apply_on_decode_only: bool, default False
+      config.kv_vae_debug: bool
     """
-    use_kv_vae = bool(getattr(self.config, 'use_kv_vae', False))
+    use_kv_vae = bool(getattr(self.config, "use_kv_vae", False))
     if not use_kv_vae:
         self.use_kv_vae = False
         return
 
-    if getattr(self, 'kv_vae_inited', False):
+    if getattr(self, "kv_vae_inited", False):
         return
 
-    ckpt_path = getattr(self.config, 'vae_ckpt_path', None)
+    ckpt_path = getattr(self.config, "vae_ckpt_path", None)
     if ckpt_path is None:
-        raise ValueError('config.use_kv_vae=True but config.vae_ckpt_path is not set.')
+        raise ValueError("config.use_kv_vae=True but config.vae_ckpt_path is not set.")
 
     ckpt_path = str(ckpt_path)
     if os.path.isdir(ckpt_path):
-        candidate = os.path.join(ckpt_path, 'trainable_vae_only.bin')
+        candidate = os.path.join(ckpt_path, "trainable_vae_only.bin")
         if not os.path.exists(candidate):
             raise FileNotFoundError(f"Could not find trainable_vae_only.bin under directory: {ckpt_path}")
         ckpt_file = candidate
@@ -183,43 +215,59 @@ def init_kv_vae_for_mistral_attn(self):
     if not os.path.exists(ckpt_file):
         raise FileNotFoundError(f"VAE checkpoint not found: {ckpt_file}")
 
-    # optional extra config json next to checkpoint
-    extra_cfg_path = os.path.join(os.path.dirname(ckpt_file), 'extra_vae_config.json')
+    extra_cfg_path = os.path.join(os.path.dirname(ckpt_file), "extra_vae_config.json")
     if os.path.exists(extra_cfg_path):
-        with open(extra_cfg_path, 'r', encoding='utf-8') as f:
+        with open(extra_cfg_path, "r", encoding="utf-8") as f:
             extra_cfg = json.load(f)
         for k, v in extra_cfg.items():
             if not hasattr(self.config, k):
                 setattr(self.config, k, v)
 
-    state = torch.load(ckpt_file, map_location='cpu')
+    state = torch.load(ckpt_file, map_location="cpu")
     if not isinstance(state, dict):
         raise ValueError(f"Unexpected checkpoint format at {ckpt_file}")
 
-    share = bool(getattr(self.config, 'share_vae_across_layers', True))
-    self.kv_vae_deterministic = bool(getattr(self.config, 'kv_vae_deterministic', True))
-    self.kv_vae_apply_on_decode_only = bool(getattr(self.config, 'kv_vae_apply_on_decode_only', False))
+    if getattr(self.config, "kv_vae_debug", False):
+        print(f"[KV-VAE DEBUG] checkpoint file: {ckpt_file}")
+        print("[KV-VAE DEBUG] first 30 keys:")
+        for k in list(state.keys())[:30]:
+            print("   ", k)
+
+    share = bool(getattr(self.config, "share_vae_across_layers", True))
+    self.kv_vae_deterministic = bool(getattr(self.config, "kv_vae_deterministic", True))
+    self.kv_vae_apply_on_decode_only = bool(getattr(self.config, "kv_vae_apply_on_decode_only", False))
     self.use_kv_vae = True
 
     if share:
-        if not hasattr(self, '_shared_inference_vae'):
-            # create pool locally on the attention object for simplicity
-            # weights are tied by reusing the exact same submodule for each group index on each layer.
-            pass
         pool = SharedInferenceVAEPool(self.config)
-        group_idx = int(self.layer_idx) // int(getattr(self.config, 'vae_group_size', 4))
-        _load_vae_group_state(pool.get_vae(int(self.layer_idx)), state, int(self.layer_idx), group_idx)
-        self.kv_vae = pool.get_vae(int(self.layer_idx))
+        group_size = int(getattr(self.config, "vae_group_size", 4))
+        group_idx = int(self.layer_idx) // group_size
+        vae_module = pool.get_vae(int(self.layer_idx))
+
+        _load_vae_group_state(
+            vae_module=vae_module,
+            full_state=state,
+            layer_idx=int(self.layer_idx),
+            group_idx=group_idx,
+            group_size=group_size,
+        )
+        self.kv_vae = vae_module
     else:
         kv_dim = self.num_key_value_heads * self.head_dim
         self.kv_vae = InferenceTokenVAE(
             input_dim=2 * kv_dim,
-            latent_dim=int(getattr(self.config, 'kv_latent_size', 32)),
-            hidden_dim=int(getattr(self.config, 'vae_hidden_size', 256)),
-            logvar_min=float(getattr(self.config, 'logvar_min', -4.0)),
-            logvar_max=float(getattr(self.config, 'logvar_max', 1.0)),
+            latent_dim=int(getattr(self.config, "kv_latent_size", 32)),
+            hidden_dim=int(getattr(self.config, "vae_hidden_size", 256)),
+            logvar_min=float(getattr(self.config, "logvar_min", -4.0)),
+            logvar_max=float(getattr(self.config, "logvar_max", 1.0)),
         )
-        _load_vae_group_state(self.kv_vae, state, int(self.layer_idx), 0)
+        _load_vae_group_state(
+            vae_module=self.kv_vae,
+            full_state=state,
+            layer_idx=int(self.layer_idx),
+            group_idx=0,
+            group_size=1,
+        )
 
     target_dtype = self.q_proj.weight.dtype
     target_device = self.q_proj.weight.device
@@ -230,45 +278,49 @@ def init_kv_vae_for_mistral_attn(self):
 
     self.kv_vae_inited = True
     logger.info(
-        f"Initialized KV-VAE for layer {self.layer_idx}. deterministic={self.kv_vae_deterministic}, "
+        f"Initialized KV-VAE for layer {self.layer_idx}. "
+        f"deterministic={self.kv_vae_deterministic}, "
         f"decode_only={self.kv_vae_apply_on_decode_only}, share={share}"
     )
 
 
 def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: torch.Tensor, q_len: int):
     """
-    Input/Output shapes:
-      key_states:   [B, num_kv_heads, T, Hd]   pre-RoPE
-      value_states: [B, num_kv_heads, T, Hd]   pre-RoPE
+    Input / output shapes:
+      key_states:   [B, num_kv_heads, T, Hd]  pre-RoPE
+      value_states: [B, num_kv_heads, T, Hd]  pre-RoPE
     """
     init_kv_vae_for_mistral_attn(attn_module)
-    if not getattr(attn_module, 'use_kv_vae', False):
+    if not getattr(attn_module, "use_kv_vae", False):
         return key_states, value_states
 
-    if getattr(attn_module, 'kv_vae_apply_on_decode_only', False) and q_len > 1:
+    if getattr(attn_module, "kv_vae_apply_on_decode_only", False) and q_len > 1:
         return key_states, value_states
 
     bsz, num_kv_heads, seq_len, head_dim = key_states.shape
+
     key_flat = key_states.transpose(1, 2).contiguous().reshape(bsz, seq_len, num_kv_heads * head_dim)
     value_flat = value_states.transpose(1, 2).contiguous().reshape(bsz, seq_len, num_kv_heads * head_dim)
     kv = torch.cat([key_flat, value_flat], dim=-1)
 
     with torch.no_grad():
-        recon_kv, mu, logvar, z = attn_module.kv_vae(kv, deterministic=getattr(attn_module, 'kv_vae_deterministic', True))
+        recon_kv, mu, logvar, z = attn_module.kv_vae(
+            kv,
+            deterministic=getattr(attn_module, "kv_vae_deterministic", True),
+        )
 
     recon_k_flat, recon_v_flat = torch.split(recon_kv, key_flat.shape[-1], dim=-1)
     recon_k = recon_k_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
     recon_v = recon_v_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
 
-    # optional debug stats on module
-    if getattr(attn_module.config, 'kv_vae_debug', False):
+    if getattr(attn_module.config, "kv_vae_debug", False):
         attn_module._kv_vae_last_stats = {
-            'mu_mean': mu.detach().float().mean().item(),
-            'mu_std': mu.detach().float().std(unbiased=False).item(),
-            'logvar_mean': logvar.detach().float().mean().item(),
-            'logvar_std': logvar.detach().float().std(unbiased=False).item(),
-            'seq_len': seq_len,
-            'q_len': q_len,
+            "mu_mean": mu.detach().float().mean().item(),
+            "mu_std": mu.detach().float().std(unbiased=False).item(),
+            "logvar_mean": logvar.detach().float().mean().item(),
+            "logvar_std": logvar.detach().float().std(unbiased=False).item(),
+            "seq_len": seq_len,
+            "q_len": q_len,
         }
 
     return recon_k, recon_v
@@ -277,7 +329,7 @@ def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: 
 def mistral_flash_attn2_forward(
     self,
     hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
+    attention_mask: Optional[torch.LongTensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
@@ -286,11 +338,11 @@ def mistral_flash_attn2_forward(
 ):
     init_snapkv(self)
 
-    if 'padding_mask' in kwargs:
+    if "padding_mask" in kwargs:
         warnings.warn(
-            "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead."
         )
-        attention_mask = kwargs.pop('padding_mask')
+        attention_mask = kwargs.pop("padding_mask")
 
     bsz, q_len, _ = hidden_states.size()
 
@@ -302,10 +354,9 @@ def mistral_flash_attn2_forward(
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    # ------------------------------------------------------------
-    # [KV-VAE] compress + decompress all pre-RoPE KV once
-    # This exactly matches the training target domain: pre-RoPE flattened KV.
-    # ------------------------------------------------------------
+    # ============================================================
+    # KV-VAE compress + decompress on ALL pre-RoPE KV
+    # ============================================================
     key_states, value_states = apply_kv_vae_if_needed(self, key_states, value_states, q_len)
 
     kv_seq_len = key_states.shape[-2]
@@ -316,7 +367,7 @@ def mistral_flash_attn2_forward(
                 "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                 "with a layer index."
             )
-        if hasattr(self, 'kv_seq_len'):
+        if hasattr(self, "kv_seq_len"):
             if self.kv_seq_len != 0:
                 kv_seq_len += self.kv_seq_len
             else:
@@ -330,14 +381,14 @@ def mistral_flash_attn2_forward(
 
     use_sliding_windows = (
         _flash_supports_window_size
-        and getattr(self.config, 'sliding_window', None) is not None
+        and getattr(self.config, "sliding_window", None) is not None
         and kv_seq_len > self.config.sliding_window
     )
 
     if not _flash_supports_window_size:
         logger.warning_once(
-            'The current flash attention version does not support sliding window attention, for a more memory efficient implementation'
-            ' make sure to upgrade flash-attn library.'
+            "The current flash attention version does not support sliding window attention, "
+            "for a more memory efficient implementation make sure to upgrade flash-attn library."
         )
 
     key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -346,7 +397,7 @@ def mistral_flash_attn2_forward(
     if past_key_value is not None:
         cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
         if (
-            getattr(self.config, 'sliding_window', None) is not None
+            getattr(self.config, "sliding_window", None) is not None
             and kv_seq_len > self.config.sliding_window
             and cache_has_contents
         ):
@@ -367,7 +418,7 @@ def mistral_flash_attn2_forward(
                 attention_mask = attention_mask[:, slicing_tokens:]
                 attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, -1:])], dim=-1)
 
-        cache_kwargs = {'sin': sin, 'cos': cos}
+        cache_kwargs = {"sin": sin, "cos": cos}
         if key_states.shape[-2] >= kv_seq_len:
             self.kv_seq_len = kv_seq_len
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
@@ -382,7 +433,7 @@ def mistral_flash_attn2_forward(
 
     input_dtype = query_states.dtype
     if input_dtype == torch.float32:
-        if hasattr(self.config, '_pre_quantization_dtype'):
+        if hasattr(self.config, "_pre_quantization_dtype"):
             target_dtype = self.config._pre_quantization_dtype
         else:
             target_dtype = self.q_proj.weight.dtype
@@ -412,9 +463,9 @@ def mistral_flash_attn2_forward(
     try:
         comp_ok = (
             past_key_value is not None
-            and getattr(self, 'kv_cluster', None) is not None
-            and getattr(self.kv_cluster, 'comp_enabled', False)
-            and getattr(self.kv_cluster, '_comp_inited', False)
+            and getattr(self, "kv_cluster", None) is not None
+            and getattr(self.kv_cluster, "comp_enabled", False)
+            and getattr(self.kv_cluster, "_comp_inited", False)
             and q_len == 1
         )
     except Exception:
@@ -453,16 +504,22 @@ def mistral_flash_attn2_forward(
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
     attn_output = self.o_proj(attn_output)
 
-    if not output_attentions:
-        attn_weights = None
-
+    attn_weights = None if not output_attentions else None
     return attn_output, attn_weights, past_key_value
 
 
-def prepare_inputs_for_generation_mistral(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
+def prepare_inputs_for_generation_mistral(
+    self,
+    input_ids,
+    past_key_values=None,
+    attention_mask=None,
+    inputs_embeds=None,
+    **kwargs,
+):
     if past_key_values is None:
         for layer in self.model.layers:
             layer.self_attn.kv_seq_len = 0
+
     if past_key_values is not None:
         if isinstance(past_key_values, Cache):
             cache_length = past_key_values.get_seq_length()
@@ -484,7 +541,7 @@ def prepare_inputs_for_generation_mistral(self, input_ids, past_key_values=None,
         ):
             attention_mask = attention_mask[:, -max_cache_length:]
 
-    position_ids = kwargs.get('position_ids', None)
+    position_ids = kwargs.get("position_ids", None)
     if attention_mask is not None and position_ids is None:
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
@@ -492,16 +549,16 @@ def prepare_inputs_for_generation_mistral(self, input_ids, past_key_values=None,
             position_ids = position_ids[:, -input_ids.shape[1]:]
 
     if inputs_embeds is not None and past_key_values is None:
-        model_inputs = {'inputs_embeds': inputs_embeds}
+        model_inputs = {"inputs_embeds": inputs_embeds}
     else:
-        model_inputs = {'input_ids': input_ids}
+        model_inputs = {"input_ids": input_ids}
 
     model_inputs.update(
         {
-            'position_ids': position_ids,
-            'past_key_values': past_key_values,
-            'use_cache': kwargs.get('use_cache'),
-            'attention_mask': attention_mask,
+            "position_ids": position_ids,
+            "past_key_values": past_key_values,
+            "use_cache": kwargs.get("use_cache"),
+            "attention_mask": attention_mask,
         }
     )
     return model_inputs
