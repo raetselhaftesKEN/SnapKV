@@ -258,7 +258,7 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         # =========================
         # VAE config for KV compress-decompress test
         # =========================
-        model.config.use_kv_vae = True
+        model.config.use_kv_vae = False
         model.config.vae_ckpt_path = "/home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_predictor_friendly/step_2000"
         model.config.kv_vae_deterministic = True
         model.config.kv_vae_apply_on_decode_only = False
@@ -274,7 +274,7 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         # =========================
         # hybrid experiment switches
         # =========================
-        model.config.use_kv_vae_hybrid = True
+        model.config.use_kv_vae_hybrid = False
         model.config.kv_vae_keep_original_ratio = 0.5  # 50% 原始 + 50% VAE
         model.config.kv_vae_mix_seed = 42  # 固定随机种子，方便复现实验
 
