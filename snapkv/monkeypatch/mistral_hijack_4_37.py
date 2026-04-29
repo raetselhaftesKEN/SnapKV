@@ -283,12 +283,48 @@ def init_kv_vae_for_mistral_attn(self):
         f"decode_only={self.kv_vae_apply_on_decode_only}, share={share}"
     )
 
+def build_kv_mix_mask(attn_module, key_states: torch.Tensor, keep_original_ratio: float):
+    """
+    Build a token-level mask for mixing original/reconstructed KV.
+
+    key_states shape: [B, num_kv_heads, T, Hd]
+
+    Return:
+      mask shape: [B, 1, T, 1]
+      mask == 1 -> keep original KV
+      mask == 0 -> use VAE reconstructed KV
+    """
+    bsz, _, seq_len, _ = key_states.shape
+    device = key_states.device
+    dtype = key_states.dtype
+
+    if keep_original_ratio <= 0.0:
+        return torch.zeros((bsz, 1, seq_len, 1), device=device, dtype=dtype)
+    if keep_original_ratio >= 1.0:
+        return torch.ones((bsz, 1, seq_len, 1), device=device, dtype=dtype)
+
+    # reproducible random mask if seed is provided
+    mix_seed = getattr(attn_module.config, "kv_vae_mix_seed", None)
+    if mix_seed is not None:
+        g = torch.Generator(device=device)
+        # layer_idx is added so different layers do not use exactly the same mask
+        g.manual_seed(int(mix_seed) + int(attn_module.layer_idx))
+        rand = torch.rand((bsz, 1, seq_len, 1), device=device, generator=g)
+    else:
+        rand = torch.rand((bsz, 1, seq_len, 1), device=device)
+
+    mask = (rand < keep_original_ratio).to(dtype)
+    return mask
 
 def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: torch.Tensor, q_len: int):
     """
     Input / output shapes:
       key_states:   [B, num_kv_heads, T, Hd]  pre-RoPE
       value_states: [B, num_kv_heads, T, Hd]  pre-RoPE
+
+    Supports:
+      1) full VAE reconstruction
+      2) hybrid original/VAE mixing for fast validation
     """
     init_kv_vae_for_mistral_attn(attn_module)
     if not getattr(attn_module, "use_kv_vae", False):
@@ -296,6 +332,9 @@ def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: 
 
     if getattr(attn_module, "kv_vae_apply_on_decode_only", False) and q_len > 1:
         return key_states, value_states
+
+    orig_key_states = key_states
+    orig_value_states = value_states
 
     bsz, num_kv_heads, seq_len, head_dim = key_states.shape
 
@@ -313,6 +352,34 @@ def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: 
     recon_k = recon_k_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
     recon_v = recon_v_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
 
+    # ============================================================
+    # Hybrid original/VAE mixing
+    # ============================================================
+    use_hybrid = bool(getattr(attn_module.config, "use_kv_vae_hybrid", False))
+    keep_original_ratio = float(getattr(attn_module.config, "kv_vae_keep_original_ratio", 0.5))
+
+    if use_hybrid:
+        # optional: only mix during prefill or decode
+        hybrid_prefill_only = bool(getattr(attn_module.config, "kv_vae_hybrid_prefill_only", False))
+        hybrid_decode_only = bool(getattr(attn_module.config, "kv_vae_hybrid_decode_only", False))
+
+        if hybrid_prefill_only and q_len == 1:
+            use_hybrid = False
+        if hybrid_decode_only and q_len > 1:
+            use_hybrid = False
+
+    if use_hybrid:
+        mix_mask = build_kv_mix_mask(attn_module, orig_key_states, keep_original_ratio)
+
+        mixed_k = mix_mask * orig_key_states + (1.0 - mix_mask) * recon_k
+        mixed_v = mix_mask * orig_value_states + (1.0 - mix_mask) * recon_v
+
+        key_states = mixed_k
+        value_states = mixed_v
+    else:
+        key_states = recon_k
+        value_states = recon_v
+
     if getattr(attn_module.config, "kv_vae_debug", False):
         attn_module._kv_vae_last_stats = {
             "mu_mean": mu.detach().float().mean().item(),
@@ -321,9 +388,11 @@ def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: 
             "logvar_std": logvar.detach().float().std(unbiased=False).item(),
             "seq_len": seq_len,
             "q_len": q_len,
+            "use_hybrid": bool(use_hybrid),
+            "keep_original_ratio": float(keep_original_ratio),
         }
 
-    return recon_k, recon_v
+    return key_states, value_states
 
 
 def mistral_flash_attn2_forward(

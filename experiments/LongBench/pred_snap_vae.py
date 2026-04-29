@@ -270,6 +270,23 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         model.config.vae_hidden_size = 256
         model.config.logvar_min = -4.0
         model.config.logvar_max = 1.0
+
+        # =========================
+        # hybrid experiment switches
+        # =========================
+        model.config.use_kv_vae_hybrid = True
+        model.config.kv_vae_keep_original_ratio = 0.5  # 50% 原始 + 50% VAE
+        model.config.kv_vae_mix_seed = 42  # 固定随机种子，方便复现实验
+
+        # 可选：只在 prefill 混合
+        model.config.kv_vae_hybrid_prefill_only = False
+
+        # 可选：只在 decode 混合
+        model.config.kv_vae_hybrid_decode_only = False
+
+        # debug
+        model.config.kv_vae_debug = False
+
     elif "mixtral" in model_name:
         if not compress:
             model = AutoModelForCausalLM.from_pretrained(
