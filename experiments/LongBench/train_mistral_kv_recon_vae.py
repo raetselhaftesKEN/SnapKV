@@ -1303,6 +1303,47 @@ if __name__ == "__main__":
     main()
 
 '''
+
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
+python train_mistral_kv_recon_vae.py \
+  --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
+  --dataset_path Salesforce/wikitext \
+  --dataset_config_name wikitext-103-raw-v1 \
+  --dataset_split train \
+  --text_column text \
+  --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_recon_vae \
+  --per_head_latent_size 32 \
+  --vae_hidden_size 512 \
+  --split_kv True \
+  --kl_weight 1e-6 \
+  --kl_warmup_steps 1000 \
+  --free_bits 0.0 \
+  --rec_weight 1.0 \
+  --ntp_weight 1.0 \
+  --cos_weight 0.25 \
+  --rel_l2_weight 0.25 \
+  --sample_during_train False \
+  --deterministic_eval True \
+  --share_vae_across_layers False \
+  --vae_group_size 1 \
+  --logvar_min -8.0 \
+  --logvar_max -2.0 \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 2e-4 \
+  --warmup_ratio 0.03 \
+  --logging_steps 10 \
+  --save_steps 500 \
+  --bf16 True \
+  --gradient_checkpointing True \
+  --use_sdpa True \
+  --max_length 768 \
+  --max_steps 2000 \
+  --latent_stats_log_steps 10 \
+  --latent_hist_save_steps 100 \
+> vae_train_20250429.log 2>&1 &
+
+
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 python train_mistral_kv_recon_vae.py \
   --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
