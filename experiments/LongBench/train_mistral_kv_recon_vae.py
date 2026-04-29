@@ -946,7 +946,7 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--bf16", type=lambda x: str(x).lower() == "true", default=True)
     parser.add_argument("--fp16", type=lambda x: str(x).lower() == "true", default=False)
-    parser.add_argument("--gradient_checkpointing", type=lambda x: str(x).lower() == "true", default=True)
+    parser.add_argument("--gradient_checkpointing", type=lambda x: str(x).lower() == "true", default=False)
     parser.add_argument("--use_sdpa", type=lambda x: str(x).lower() == "true", default=True)
     parser.add_argument("--seed", type=int, default=42)
 
@@ -1190,13 +1190,15 @@ def main():
     print(f"Total trainable params: {total_trainable:,}")
     print("============================")
 
+    # IMPORTANT:
+    # This reconstruction-first dual-forward script uses cross-pass layer buffers
+    # (raw teacher KV saved in raw pass, consumed in comp pass).
+    # Gradient checkpointing recomputes layer forwards during backward and breaks
+    # this assumption, causing "raw KV buffers are missing" errors.
     if args.gradient_checkpointing:
-        try:
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        except TypeError:
-            model.gradient_checkpointing_enable()
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
+        print("[Warning] gradient_checkpointing is incompatible with this dual-forward KV reconstruction script.")
+        print("[Warning] It is being disabled automatically.")
+    args.gradient_checkpointing = False
 
     train_dataset, approx_len, tokenized_mode = build_training_dataset(args, tokenizer)
 
@@ -1352,7 +1354,7 @@ python train_mistral_kv_recon_vae.py \
   --text_column text \
   --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_recon_vae \
   --per_head_latent_size 32 \
-  --vae_hidden_size 256 \
+  --vae_hidden_size 192 \
   --split_kv True \
   --kl_weight 1e-6 \
   --kl_warmup_steps 1000 \
@@ -1367,7 +1369,7 @@ python train_mistral_kv_recon_vae.py \
   --vae_group_size 1 \
   --logvar_min -8.0 \
   --logvar_max -2.0 \
-  --head_chunk_size 512 \
+  --head_chunk_size 256 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 8 \
   --learning_rate 2e-4 \
@@ -1375,9 +1377,9 @@ python train_mistral_kv_recon_vae.py \
   --logging_steps 10 \
   --save_steps 500 \
   --bf16 True \
-  --gradient_checkpointing True \
+  --gradient_checkpointing False \
   --use_sdpa True \
-  --max_length 768 \
+  --max_length 512 \
   --max_steps 2000 \
   --latent_stats_log_steps 10 \
   --latent_hist_save_steps 100
