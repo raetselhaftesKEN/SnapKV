@@ -14,6 +14,8 @@ Key design:
 4) almost deterministic bottleneck
 5) reconstruction-first losses:
    total = ntp * lm + rec * mse + cos * cosine + rel_l2 * relative_l2 + tiny_kl * KL
+6) raw teacher KV offloaded to CPU immediately to save VRAM
+7) head-wise VAE processed in chunks to reduce peak memory
 """
 
 import os
@@ -55,12 +57,10 @@ CUR_STEP = 1
 # =========================================================
 @dataclass
 class ExtraVAEArgs:
-    # reconstruction-first
     per_head_latent_size: int = 32
-    vae_hidden_size: int = 512
+    vae_hidden_size: int = 256
     split_kv: bool = True
 
-    # almost deterministic
     kl_weight: float = 1e-6
     kl_warmup_steps: int = 1000
     free_bits: float = 0.0
@@ -77,11 +77,9 @@ class ExtraVAEArgs:
     use_vae: bool = True
     use_sdpa: bool = True
 
-    # for max fidelity: one VAE per layer by default
     share_vae_across_layers: bool = False
     vae_group_size: int = 1
 
-    # keep variance small and controlled
     logvar_min: float = -8.0
     logvar_max: float = -2.0
 
@@ -89,6 +87,8 @@ class ExtraVAEArgs:
     latent_hist_save_steps: int = 100
     latent_hist_max_points: int = 4096
     latent_hist_dirname: str = "latent_stats"
+
+    head_chunk_size: int = 1024
 
 
 def inject_extra_config(config, extra: ExtraVAEArgs):
@@ -210,9 +210,6 @@ def rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-6):
 # KL helpers
 # =========================================================
 def kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """
-    return [B, T]
-    """
     kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
     return kl.sum(dim=-1)
 
@@ -298,12 +295,23 @@ class LayerwiseKVVAE(nn.Module):
     Reconstruction-first KV VAE:
     - split K and V
     - compress each kv-head independently
+    - process in chunks to reduce peak memory
     """
-    def __init__(self, num_kv_heads: int, head_dim: int, per_head_latent_size: int, hidden_dim: int, logvar_min: float = -8.0, logvar_max: float = -2.0):
+    def __init__(
+        self,
+        num_kv_heads: int,
+        head_dim: int,
+        per_head_latent_size: int,
+        hidden_dim: int,
+        logvar_min: float = -8.0,
+        logvar_max: float = -2.0,
+        chunk_size: int = 1024,
+    ):
         super().__init__()
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.per_head_latent_size = per_head_latent_size
+        self.chunk_size = chunk_size
 
         self.k_core = HeadwiseVAECore(
             input_dim=head_dim,
@@ -321,23 +329,36 @@ class LayerwiseKVVAE(nn.Module):
         )
 
     def _run_core(self, x_flat: torch.Tensor, core: nn.Module, deterministic: bool):
-        """
-        x_flat: [B, T, num_kv_heads * head_dim]
-        """
         bsz, seq_len, total_dim = x_flat.shape
         x = x_flat.view(bsz, seq_len, self.num_kv_heads, self.head_dim)
         x = x.reshape(bsz * seq_len * self.num_kv_heads, self.head_dim)
 
-        recon, mu, logvar, z = core(x, deterministic=deterministic)
+        recons = []
+        mus = []
+        logvars = []
+
+        for start in range(0, x.size(0), self.chunk_size):
+            end = min(start + self.chunk_size, x.size(0))
+            x_chunk = x[start:end]
+
+            recon, mu, logvar, _ = core(x_chunk, deterministic=deterministic)
+
+            recons.append(recon)
+            mus.append(mu)
+            logvars.append(logvar)
+
+        recon = torch.cat(recons, dim=0)
+        mu = torch.cat(mus, dim=0)
+        logvar = torch.cat(logvars, dim=0)
 
         recon = recon.view(bsz, seq_len, self.num_kv_heads, self.head_dim).reshape(bsz, seq_len, total_dim)
         mu = mu.view(bsz, seq_len, self.num_kv_heads * self.per_head_latent_size)
         logvar = logvar.view(bsz, seq_len, self.num_kv_heads * self.per_head_latent_size)
-        return recon, mu, logvar, z
+        return recon, mu, logvar
 
     def forward(self, key_states_flat: torch.Tensor, value_states_flat: torch.Tensor, deterministic: bool = False):
-        k_recon, k_mu, k_logvar, _ = self._run_core(key_states_flat, self.k_core, deterministic=deterministic)
-        v_recon, v_mu, v_logvar, _ = self._run_core(value_states_flat, self.v_core, deterministic=deterministic)
+        k_recon, k_mu, k_logvar = self._run_core(key_states_flat, self.k_core, deterministic=deterministic)
+        v_recon, v_mu, v_logvar = self._run_core(value_states_flat, self.v_core, deterministic=deterministic)
 
         mu = torch.cat([k_mu, v_mu], dim=-1)
         logvar = torch.cat([k_logvar, v_logvar], dim=-1)
@@ -353,15 +374,17 @@ class SharedVAEPool(nn.Module):
 
         head_dim = config.hidden_size // config.num_attention_heads
         num_kv_heads = config.num_key_value_heads
+        chunk_size = int(getattr(config, "head_chunk_size", 1024))
 
         self.group_vaes = nn.ModuleList([
             LayerwiseKVVAE(
                 num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 per_head_latent_size=int(getattr(config, "per_head_latent_size", 32)),
-                hidden_dim=int(getattr(config, "vae_hidden_size", 512)),
+                hidden_dim=int(getattr(config, "vae_hidden_size", 256)),
                 logvar_min=float(getattr(config, "logvar_min", -8.0)),
                 logvar_max=float(getattr(config, "logvar_max", -2.0)),
+                chunk_size=chunk_size,
             )
             for _ in range(self.num_groups)
         ])
@@ -439,17 +462,23 @@ class MistralAttentionVAE(MistralAttention):
                 num_kv_heads=self.num_key_value_heads,
                 head_dim=self.head_dim,
                 per_head_latent_size=int(getattr(config, "per_head_latent_size", 32)),
-                hidden_dim=int(getattr(config, "vae_hidden_size", 512)),
+                hidden_dim=int(getattr(config, "vae_hidden_size", 256)),
                 logvar_min=float(getattr(config, "logvar_min", -8.0)),
                 logvar_max=float(getattr(config, "logvar_max", -2.0)),
+                chunk_size=int(getattr(config, "head_chunk_size", 1024)),
             )
 
-        self.buffer_raw_k = None
-        self.buffer_raw_v = None
-        self.buffer_recon_k = None
-        self.buffer_recon_v = None
+        # CPU teacher buffers
+        self.buffer_raw_k_cpu = None
+        self.buffer_raw_v_cpu = None
+
+        # scalar losses only
+        self.buffer_rec_loss = None
+        self.buffer_cos_loss = None
+        self.buffer_rel_l2_loss = None
         self.buffer_kl = None
 
+        # stats
         self.buffer_mu_stats = None
         self.buffer_logvar_stats = None
         self.buffer_mu_sample = None
@@ -468,8 +497,26 @@ class MistralAttentionVAE(MistralAttention):
         kl_fb = apply_free_bits(kl_raw, float(getattr(self.config, "free_bits", 0.0)))
         self.buffer_kl = kl_fb.mean()
 
-        self.buffer_recon_k = recon_k
-        self.buffer_recon_v = recon_v
+        if self.buffer_raw_k_cpu is None or self.buffer_raw_v_cpu is None:
+            raise RuntimeError(f"Layer {self.layer_idx}: raw KV buffers are missing before reconstruction loss computation.")
+
+        raw_k = self.buffer_raw_k_cpu.to(device=recon_k.device, dtype=recon_k.dtype, non_blocking=True)
+        raw_v = self.buffer_raw_v_cpu.to(device=recon_v.device, dtype=recon_v.dtype, non_blocking=True)
+
+        self.buffer_rec_loss = 0.5 * (
+            F.mse_loss(recon_k, raw_k) +
+            F.mse_loss(recon_v, raw_v)
+        )
+
+        self.buffer_cos_loss = 0.5 * (
+            cosine_recon_loss(recon_k, raw_k) +
+            cosine_recon_loss(recon_v, raw_v)
+        )
+
+        self.buffer_rel_l2_loss = 0.5 * (
+            relative_l2_loss(recon_k, raw_k) +
+            relative_l2_loss(recon_v, raw_v)
+        )
 
         mu_stats = tensor_basic_stats(mu)
         mu_stats["numel"] = mu.numel()
@@ -481,6 +528,11 @@ class MistralAttentionVAE(MistralAttention):
         max_points = int(getattr(self.config, "latent_hist_max_points", 4096))
         self.buffer_mu_sample = sample_flat_values(mu, max_points)
         self.buffer_logvar_sample = sample_flat_values(logvar, max_points)
+
+        # release teacher KV immediately
+        self.buffer_raw_k_cpu = None
+        self.buffer_raw_v_cpu = None
+        del raw_k, raw_v
 
         return recon_k, recon_v
 
@@ -502,8 +554,9 @@ class MistralAttentionVAE(MistralAttention):
         key_states_flat = self.k_proj(hidden_states)
         value_states_flat = self.v_proj(hidden_states)
 
-        self.buffer_raw_k = key_states_flat
-        self.buffer_raw_v = value_states_flat
+        # offload raw teacher KV to CPU immediately
+        self.buffer_raw_k_cpu = key_states_flat.detach().to(torch.float16).cpu()
+        self.buffer_raw_v_cpu = value_states_flat.detach().to(torch.float16).cpu()
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states_flat.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -731,30 +784,13 @@ class MistralForCausalLMVAE(MistralForCausalLM):
 
         for mod in self.modules():
             if isinstance(mod, MistralAttentionVAE):
-                if mod.buffer_raw_k is None or mod.buffer_raw_v is None or mod.buffer_recon_k is None or mod.buffer_recon_v is None:
+                if mod.buffer_rec_loss is None:
                     continue
 
-                layer_mse = 0.5 * (
-                    self.mse(mod.buffer_recon_k, mod.buffer_raw_k) +
-                    self.mse(mod.buffer_recon_v, mod.buffer_raw_v)
-                )
-
-                layer_cos = 0.5 * (
-                    cosine_recon_loss(mod.buffer_recon_k, mod.buffer_raw_k) +
-                    cosine_recon_loss(mod.buffer_recon_v, mod.buffer_raw_v)
-                )
-
-                layer_rel = 0.5 * (
-                    relative_l2_loss(mod.buffer_recon_k, mod.buffer_raw_k) +
-                    relative_l2_loss(mod.buffer_recon_v, mod.buffer_raw_v)
-                )
-
-                layer_kl = mod.buffer_kl if mod.buffer_kl is not None else hidden_states.new_tensor(0.0)
-
-                rec_loss = layer_mse if rec_loss is None else (rec_loss + layer_mse)
-                cos_loss = layer_cos if cos_loss is None else (cos_loss + layer_cos)
-                rel_l2 = layer_rel if rel_l2 is None else (rel_l2 + layer_rel)
-                kl_loss = layer_kl if kl_loss is None else (kl_loss + layer_kl)
+                rec_loss = mod.buffer_rec_loss if rec_loss is None else (rec_loss + mod.buffer_rec_loss)
+                cos_loss = mod.buffer_cos_loss if cos_loss is None else (cos_loss + mod.buffer_cos_loss)
+                rel_l2 = mod.buffer_rel_l2_loss if rel_l2 is None else (rel_l2 + mod.buffer_rel_l2_loss)
+                kl_loss = mod.buffer_kl if kl_loss is None else (kl_loss + mod.buffer_kl)
 
                 counted_layers += 1
 
@@ -767,15 +803,16 @@ class MistralForCausalLMVAE(MistralForCausalLM):
                 if mod.buffer_logvar_sample is not None:
                     logvar_samples.append(mod.buffer_logvar_sample)
 
-                mod.buffer_raw_k = None
-                mod.buffer_raw_v = None
-                mod.buffer_recon_k = None
-                mod.buffer_recon_v = None
+                mod.buffer_rec_loss = None
+                mod.buffer_cos_loss = None
+                mod.buffer_rel_l2_loss = None
                 mod.buffer_kl = None
                 mod.buffer_mu_stats = None
                 mod.buffer_logvar_stats = None
                 mod.buffer_mu_sample = None
                 mod.buffer_logvar_sample = None
+                mod.buffer_raw_k_cpu = None
+                mod.buffer_raw_v_cpu = None
 
         if counted_layers > 0:
             rec_loss = rec_loss / counted_layers
@@ -870,7 +907,7 @@ def parse_args():
 
     # vae
     parser.add_argument("--per_head_latent_size", type=int, default=32)
-    parser.add_argument("--vae_hidden_size", type=int, default=512)
+    parser.add_argument("--vae_hidden_size", type=int, default=256)
     parser.add_argument("--split_kv", type=lambda x: str(x).lower() == "true", default=True)
 
     parser.add_argument("--kl_weight", type=float, default=1e-6)
@@ -894,6 +931,8 @@ def parse_args():
     parser.add_argument("--latent_hist_save_steps", type=int, default=100)
     parser.add_argument("--latent_hist_max_points", type=int, default=4096)
     parser.add_argument("--latent_hist_dirname", type=str, default="latent_stats")
+
+    parser.add_argument("--head_chunk_size", type=int, default=1024)
 
     # train
     parser.add_argument("--num_train_epochs", type=int, default=1)
@@ -1128,6 +1167,7 @@ def main():
         latent_hist_save_steps=args.latent_hist_save_steps,
         latent_hist_max_points=args.latent_hist_max_points,
         latent_hist_dirname=args.latent_hist_dirname,
+        head_chunk_size=args.head_chunk_size,
     )
     config = inject_extra_config(raw_config, extra)
     config.output_dir = args.output_dir
@@ -1303,47 +1343,6 @@ if __name__ == "__main__":
     main()
 
 '''
-
-nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
-python train_mistral_kv_recon_vae.py \
-  --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
-  --dataset_path Salesforce/wikitext \
-  --dataset_config_name wikitext-103-raw-v1 \
-  --dataset_split train \
-  --text_column text \
-  --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_recon_vae \
-  --per_head_latent_size 32 \
-  --vae_hidden_size 512 \
-  --split_kv True \
-  --kl_weight 1e-6 \
-  --kl_warmup_steps 1000 \
-  --free_bits 0.0 \
-  --rec_weight 1.0 \
-  --ntp_weight 1.0 \
-  --cos_weight 0.25 \
-  --rel_l2_weight 0.25 \
-  --sample_during_train False \
-  --deterministic_eval True \
-  --share_vae_across_layers False \
-  --vae_group_size 1 \
-  --logvar_min -8.0 \
-  --logvar_max -2.0 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 8 \
-  --learning_rate 2e-4 \
-  --warmup_ratio 0.03 \
-  --logging_steps 10 \
-  --save_steps 500 \
-  --bf16 True \
-  --gradient_checkpointing True \
-  --use_sdpa True \
-  --max_length 768 \
-  --max_steps 2000 \
-  --latent_stats_log_steps 10 \
-  --latent_hist_save_steps 100 \
-> vae_train_20250429.log 2>&1 &
-
-
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 python train_mistral_kv_recon_vae.py \
   --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
@@ -1353,7 +1352,7 @@ python train_mistral_kv_recon_vae.py \
   --text_column text \
   --output_dir /home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_recon_vae \
   --per_head_latent_size 32 \
-  --vae_hidden_size 512 \
+  --vae_hidden_size 256 \
   --split_kv True \
   --kl_weight 1e-6 \
   --kl_warmup_steps 1000 \
@@ -1368,6 +1367,7 @@ python train_mistral_kv_recon_vae.py \
   --vae_group_size 1 \
   --logvar_min -8.0 \
   --logvar_max -2.0 \
+  --head_chunk_size 512 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 8 \
   --learning_rate 2e-4 \
