@@ -3,7 +3,6 @@ import json
 import os
 import math
 import warnings
-from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 
 import torch
@@ -25,14 +24,18 @@ if is_flash_attn_2_available():
 
 
 # ============================================================
-# Predictor-friendly KV-VAE inference helpers
+# Reconstruction-first KV-VAE inference helpers
 # ============================================================
-class InferenceTokenVAE(nn.Module):
+def rms_normalize_last_dim(x: torch.Tensor, eps: float = 1e-6):
+    rms = x.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
+    return x / rms, rms
+
+
+class InferenceHeadwiseVAECore(nn.Module):
     """
-    Inference-only mirror of predictor-friendly training VAE.
-    Default inference is deterministic: z = mu
+    Mirror of train_mistral_kv_recon_vae.py -> HeadwiseVAECore
     """
-    def __init__(self, input_dim: int, latent_dim: int, hidden_dim: int, logvar_min: float = -4.0, logvar_max: float = 1.0):
+    def __init__(self, input_dim: int, latent_dim: int, hidden_dim: int, logvar_min: float = -8.0, logvar_max: float = -2.0):
         super().__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
@@ -40,8 +43,7 @@ class InferenceTokenVAE(nn.Module):
         self.logvar_min = logvar_min
         self.logvar_max = logvar_max
 
-        # encoder
-        self.in_proj = nn.Linear(input_dim, hidden_dim)
+        self.enc_in = nn.Linear(input_dim, hidden_dim)
         self.enc_fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.enc_fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.enc_ln = nn.LayerNorm(hidden_dim)
@@ -49,67 +51,143 @@ class InferenceTokenVAE(nn.Module):
         self.mu_proj = nn.Linear(hidden_dim, latent_dim)
         self.logvar_proj = nn.Linear(hidden_dim, latent_dim)
 
-        # decoder
         self.dec_in = nn.Linear(latent_dim, hidden_dim)
         self.dec_fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.dec_fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.dec_ln = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, input_dim)
 
-    def encode_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        h = F.silu(self.in_proj(x))
+    def encode(self, x: torch.Tensor):
+        x_norm, x_rms = rms_normalize_last_dim(x)
+
+        h = F.silu(self.enc_in(x_norm))
         h_res = h
         h = F.silu(self.enc_fc1(h))
         h = self.enc_fc2(h)
         h = self.enc_ln(h + h_res)
         h = F.silu(h)
-        return h
 
-    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = self.encode_hidden(x)
         mu = self.mu_proj(h)
         logvar_raw = self.logvar_proj(h)
         logvar = torch.clamp(logvar_raw, min=self.logvar_min, max=self.logvar_max)
-        return mu, logvar
+        return mu, logvar, x_rms
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, x_rms: torch.Tensor):
         h = F.silu(self.dec_in(z))
         h_res = h
         h = F.silu(self.dec_fc1(h))
         h = self.dec_fc2(h)
         h = self.dec_ln(h + h_res)
         h = F.silu(h)
-        return self.out_proj(h)
+        out_norm = self.out_proj(h)
+        out = out_norm * x_rms
+        return out
 
     def forward(self, x: torch.Tensor, deterministic: bool = True):
-        mu, logvar = self.encode(x)
+        mu, logvar, x_rms = self.encode(x)
         if deterministic:
             z = mu
         else:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             z = mu + eps * std
-        recon = self.decode(z)
+        recon = self.decode(z, x_rms)
         return recon, mu, logvar, z
+
+
+class InferenceLayerwiseKVVAE(nn.Module):
+    """
+    Mirror of train_mistral_kv_recon_vae.py -> LayerwiseKVVAE
+    - split K / V
+    - compress each kv-head independently
+    """
+    def __init__(
+        self,
+        num_kv_heads: int,
+        head_dim: int,
+        per_head_latent_size: int,
+        hidden_dim: int,
+        logvar_min: float = -8.0,
+        logvar_max: float = -2.0,
+        chunk_size: int = 1024,
+    ):
+        super().__init__()
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.per_head_latent_size = per_head_latent_size
+        self.chunk_size = chunk_size
+
+        self.k_core = InferenceHeadwiseVAECore(
+            input_dim=head_dim,
+            latent_dim=per_head_latent_size,
+            hidden_dim=hidden_dim,
+            logvar_min=logvar_min,
+            logvar_max=logvar_max,
+        )
+        self.v_core = InferenceHeadwiseVAECore(
+            input_dim=head_dim,
+            latent_dim=per_head_latent_size,
+            hidden_dim=hidden_dim,
+            logvar_min=logvar_min,
+            logvar_max=logvar_max,
+        )
+
+    def _run_core(self, x_flat: torch.Tensor, core: nn.Module, deterministic: bool):
+        # x_flat: [B, T, num_kv_heads * head_dim]
+        bsz, seq_len, total_dim = x_flat.shape
+        x = x_flat.view(bsz, seq_len, self.num_kv_heads, self.head_dim)
+        x = x.reshape(bsz * seq_len * self.num_kv_heads, self.head_dim)
+
+        recons = []
+        mus = []
+        logvars = []
+
+        for start in range(0, x.size(0), self.chunk_size):
+            end = min(start + self.chunk_size, x.size(0))
+            x_chunk = x[start:end]
+            recon, mu, logvar, _ = core(x_chunk, deterministic=deterministic)
+            recons.append(recon)
+            mus.append(mu)
+            logvars.append(logvar)
+
+        recon = torch.cat(recons, dim=0)
+        mu = torch.cat(mus, dim=0)
+        logvar = torch.cat(logvars, dim=0)
+
+        recon = recon.view(bsz, seq_len, self.num_kv_heads, self.head_dim).reshape(bsz, seq_len, total_dim)
+        mu = mu.view(bsz, seq_len, self.num_kv_heads * self.per_head_latent_size)
+        logvar = logvar.view(bsz, seq_len, self.num_kv_heads * self.per_head_latent_size)
+        return recon, mu, logvar
+
+    def forward(self, key_states_flat: torch.Tensor, value_states_flat: torch.Tensor, deterministic: bool = True):
+        k_recon, k_mu, k_logvar = self._run_core(key_states_flat, self.k_core, deterministic=deterministic)
+        v_recon, v_mu, v_logvar = self._run_core(value_states_flat, self.v_core, deterministic=deterministic)
+
+        mu = torch.cat([k_mu, v_mu], dim=-1)
+        logvar = torch.cat([k_logvar, v_logvar], dim=-1)
+        return k_recon, v_recon, mu, logvar
 
 
 class SharedInferenceVAEPool(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.group_size = int(getattr(config, "vae_group_size", 4))
+        self.group_size = int(getattr(config, "vae_group_size", 1))
         self.num_layers = int(config.num_hidden_layers)
         self.num_groups = math.ceil(self.num_layers / self.group_size)
 
-        kv_dim = config.num_key_value_heads * (config.hidden_size // config.num_attention_heads)
-        input_dim = 2 * kv_dim
+        head_dim = config.hidden_size // config.num_attention_heads
+        num_kv_heads = config.num_key_value_heads
+        chunk_size = int(getattr(config, "head_chunk_size", 1024))
 
         self.group_vaes = nn.ModuleList([
-            InferenceTokenVAE(
-                input_dim=input_dim,
-                latent_dim=int(getattr(config, "kv_latent_size", 32)),
+            InferenceLayerwiseKVVAE(
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                per_head_latent_size=int(getattr(config, "per_head_latent_size", 32)),
                 hidden_dim=int(getattr(config, "vae_hidden_size", 256)),
-                logvar_min=float(getattr(config, "logvar_min", -4.0)),
-                logvar_max=float(getattr(config, "logvar_max", 1.0)),
+                logvar_min=float(getattr(config, "logvar_min", -8.0)),
+                logvar_max=float(getattr(config, "logvar_max", -2.0)),
+                chunk_size=chunk_size,
             )
             for _ in range(self.num_groups)
         ])
@@ -129,27 +207,15 @@ def _load_vae_group_state(
     full_state: Dict[str, torch.Tensor],
     layer_idx: int,
     group_idx: int,
-    group_size: int = 4,
+    group_size: int = 1,
 ):
-    """
-    Robust loader for shared-vae checkpoints.
-
-    For share_vae_across_layers=True, PyTorch often only saves one canonical path
-    for the shared module. So for group 0, even layer 1/2/3 may need to load from:
-      model.layers.0.self_attn.kv_vae.*
-    """
     group_start_layer = group_idx * group_size
 
     candidates = [
-        # shared-pool style naming
         f"model.shared_vae_pool.group_vaes.{group_idx}.",
         f"shared_vae_pool.group_vaes.{group_idx}.",
-
-        # exact current layer naming
         f"model.layers.{layer_idx}.self_attn.kv_vae.",
         f"layers.{layer_idx}.self_attn.kv_vae.",
-
-        # representative layer naming for this shared group
         f"model.layers.{group_start_layer}.self_attn.kv_vae.",
         f"layers.{group_start_layer}.self_attn.kv_vae.",
     ]
@@ -167,7 +233,7 @@ def _load_vae_group_state(
             break
 
     if not loaded:
-        preview_keys = list(full_state.keys())[:50]
+        preview_keys = list(full_state.keys())[:60]
         raise KeyError(
             f"Could not find VAE weights for layer {layer_idx} / group {group_idx}. "
             f"Tried prefixes: {candidates}. "
@@ -176,21 +242,6 @@ def _load_vae_group_state(
 
 
 def init_kv_vae_for_mistral_attn(self):
-    """
-    Lazy init on each attention module.
-
-    Required config fields:
-      config.use_kv_vae: bool
-      config.vae_ckpt_path: checkpoint dir or trainable_vae_only.bin
-
-    Optional config fields:
-      config.kv_vae_deterministic: bool, default True
-      config.kv_vae_apply_on_decode_only: bool, default False
-      config.share_vae_across_layers: bool, default True
-      config.vae_group_size: int, default 4
-      config.kv_latent_size, config.vae_hidden_size, config.logvar_min, config.logvar_max
-      config.kv_vae_debug: bool
-    """
     use_kv_vae = bool(getattr(self.config, "use_kv_vae", False))
     if not use_kv_vae:
         self.use_kv_vae = False
@@ -229,18 +280,18 @@ def init_kv_vae_for_mistral_attn(self):
 
     if getattr(self.config, "kv_vae_debug", False):
         print(f"[KV-VAE DEBUG] checkpoint file: {ckpt_file}")
-        print("[KV-VAE DEBUG] first 30 keys:")
-        for k in list(state.keys())[:30]:
+        print("[KV-VAE DEBUG] first 40 keys:")
+        for k in list(state.keys())[:40]:
             print("   ", k)
 
-    share = bool(getattr(self.config, "share_vae_across_layers", True))
+    share = bool(getattr(self.config, "share_vae_across_layers", False))
     self.kv_vae_deterministic = bool(getattr(self.config, "kv_vae_deterministic", True))
     self.kv_vae_apply_on_decode_only = bool(getattr(self.config, "kv_vae_apply_on_decode_only", False))
     self.use_kv_vae = True
 
     if share:
         pool = SharedInferenceVAEPool(self.config)
-        group_size = int(getattr(self.config, "vae_group_size", 4))
+        group_size = int(getattr(self.config, "vae_group_size", 1))
         group_idx = int(self.layer_idx) // group_size
         vae_module = pool.get_vae(int(self.layer_idx))
 
@@ -253,13 +304,14 @@ def init_kv_vae_for_mistral_attn(self):
         )
         self.kv_vae = vae_module
     else:
-        kv_dim = self.num_key_value_heads * self.head_dim
-        self.kv_vae = InferenceTokenVAE(
-            input_dim=2 * kv_dim,
-            latent_dim=int(getattr(self.config, "kv_latent_size", 32)),
+        self.kv_vae = InferenceLayerwiseKVVAE(
+            num_kv_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            per_head_latent_size=int(getattr(self.config, "per_head_latent_size", 32)),
             hidden_dim=int(getattr(self.config, "vae_hidden_size", 256)),
-            logvar_min=float(getattr(self.config, "logvar_min", -4.0)),
-            logvar_max=float(getattr(self.config, "logvar_max", 1.0)),
+            logvar_min=float(getattr(self.config, "logvar_min", -8.0)),
+            logvar_max=float(getattr(self.config, "logvar_max", -2.0)),
+            chunk_size=int(getattr(self.config, "head_chunk_size", 1024)),
         )
         _load_vae_group_state(
             vae_module=self.kv_vae,
@@ -278,53 +330,15 @@ def init_kv_vae_for_mistral_attn(self):
 
     self.kv_vae_inited = True
     logger.info(
-        f"Initialized KV-VAE for layer {self.layer_idx}. "
+        f"Initialized reconstruction-first KV-VAE for layer {self.layer_idx}. "
         f"deterministic={self.kv_vae_deterministic}, "
         f"decode_only={self.kv_vae_apply_on_decode_only}, share={share}"
     )
 
-def build_kv_mix_mask(attn_module, key_states: torch.Tensor, keep_original_ratio: float):
-    """
-    Build a token-level mask for mixing original/reconstructed KV.
-
-    key_states shape: [B, num_kv_heads, T, Hd]
-
-    Return:
-      mask shape: [B, 1, T, 1]
-      mask == 1 -> keep original KV
-      mask == 0 -> use VAE reconstructed KV
-    """
-    bsz, _, seq_len, _ = key_states.shape
-    device = key_states.device
-    dtype = key_states.dtype
-
-    if keep_original_ratio <= 0.0:
-        return torch.zeros((bsz, 1, seq_len, 1), device=device, dtype=dtype)
-    if keep_original_ratio >= 1.0:
-        return torch.ones((bsz, 1, seq_len, 1), device=device, dtype=dtype)
-
-    # reproducible random mask if seed is provided
-    mix_seed = getattr(attn_module.config, "kv_vae_mix_seed", None)
-    if mix_seed is not None:
-        g = torch.Generator(device=device)
-        # layer_idx is added so different layers do not use exactly the same mask
-        g.manual_seed(int(mix_seed) + int(attn_module.layer_idx))
-        rand = torch.rand((bsz, 1, seq_len, 1), device=device, generator=g)
-    else:
-        rand = torch.rand((bsz, 1, seq_len, 1), device=device)
-
-    mask = (rand < keep_original_ratio).to(dtype)
-    return mask
 
 def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: torch.Tensor, q_len: int):
     """
-    Input / output shapes:
-      key_states:   [B, num_kv_heads, T, Hd]  pre-RoPE
-      value_states: [B, num_kv_heads, T, Hd]  pre-RoPE
-
-    Supports:
-      1) full VAE reconstruction
-      2) hybrid original/VAE mixing for fast validation
+    key_states/value_states: [B, num_kv_heads, T, Hd], pre-RoPE
     """
     init_kv_vae_for_mistral_attn(attn_module)
     if not getattr(attn_module, "use_kv_vae", False):
@@ -333,52 +347,20 @@ def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: 
     if getattr(attn_module, "kv_vae_apply_on_decode_only", False) and q_len > 1:
         return key_states, value_states
 
-    orig_key_states = key_states
-    orig_value_states = value_states
-
     bsz, num_kv_heads, seq_len, head_dim = key_states.shape
 
     key_flat = key_states.transpose(1, 2).contiguous().reshape(bsz, seq_len, num_kv_heads * head_dim)
     value_flat = value_states.transpose(1, 2).contiguous().reshape(bsz, seq_len, num_kv_heads * head_dim)
-    kv = torch.cat([key_flat, value_flat], dim=-1)
 
     with torch.no_grad():
-        recon_kv, mu, logvar, z = attn_module.kv_vae(
-            kv,
+        recon_k_flat, recon_v_flat, mu, logvar = attn_module.kv_vae(
+            key_flat,
+            value_flat,
             deterministic=getattr(attn_module, "kv_vae_deterministic", True),
         )
 
-    recon_k_flat, recon_v_flat = torch.split(recon_kv, key_flat.shape[-1], dim=-1)
     recon_k = recon_k_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
     recon_v = recon_v_flat.view(bsz, seq_len, num_kv_heads, head_dim).transpose(1, 2).contiguous()
-
-    # ============================================================
-    # Hybrid original/VAE mixing
-    # ============================================================
-    use_hybrid = bool(getattr(attn_module.config, "use_kv_vae_hybrid", False))
-    keep_original_ratio = float(getattr(attn_module.config, "kv_vae_keep_original_ratio", 0.5))
-
-    if use_hybrid:
-        # optional: only mix during prefill or decode
-        hybrid_prefill_only = bool(getattr(attn_module.config, "kv_vae_hybrid_prefill_only", False))
-        hybrid_decode_only = bool(getattr(attn_module.config, "kv_vae_hybrid_decode_only", False))
-
-        if hybrid_prefill_only and q_len == 1:
-            use_hybrid = False
-        if hybrid_decode_only and q_len > 1:
-            use_hybrid = False
-
-    if use_hybrid:
-        mix_mask = build_kv_mix_mask(attn_module, orig_key_states, keep_original_ratio)
-
-        mixed_k = mix_mask * orig_key_states + (1.0 - mix_mask) * recon_k
-        mixed_v = mix_mask * orig_value_states + (1.0 - mix_mask) * recon_v
-
-        key_states = mixed_k
-        value_states = mixed_v
-    else:
-        key_states = recon_k
-        value_states = recon_v
 
     if getattr(attn_module.config, "kv_vae_debug", False):
         attn_module._kv_vae_last_stats = {
@@ -388,11 +370,9 @@ def apply_kv_vae_if_needed(attn_module, key_states: torch.Tensor, value_states: 
             "logvar_std": logvar.detach().float().std(unbiased=False).item(),
             "seq_len": seq_len,
             "q_len": q_len,
-            "use_hybrid": bool(use_hybrid),
-            "keep_original_ratio": float(keep_original_ratio),
         }
 
-    return key_states, value_states
+    return recon_k, recon_v
 
 
 def mistral_flash_attn2_forward(
@@ -423,9 +403,7 @@ def mistral_flash_attn2_forward(
     key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
     value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-    # ============================================================
-    # KV-VAE compress + decompress on ALL pre-RoPE KV
-    # ============================================================
+    # reconstruction-first VAE on ALL pre-RoPE KV
     key_states, value_states = apply_kv_vae_if_needed(self, key_states, value_states, q_len)
 
     kv_seq_len = key_states.shape[-2]
@@ -528,7 +506,6 @@ def mistral_flash_attn2_forward(
         use_sliding_windows=use_sliding_windows,
     )
 
-    # keep original compensation logic
     try:
         comp_ok = (
             past_key_value is not None
