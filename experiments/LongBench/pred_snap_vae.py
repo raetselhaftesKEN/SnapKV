@@ -103,8 +103,9 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         # =========================
         # VAE 配置改成 reconstruction-first 训练结构
         # =========================
+        # VAE 配置修改为训练一致
         model.config.use_kv_vae = True
-        model.config.vae_ckpt_path = "/home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_recon_vae/step_2000"
+        model.config.vae_ckpt_path = "/home/ymz/SnapKV/SnapKV/experiments/LongBench/mistral_kv_recon_vae/step_2000"  # 指向训练完成的 VAE checkpoint
         model.config.kv_vae_deterministic = True
         model.config.kv_vae_apply_on_decode_only = False
 
@@ -112,18 +113,17 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         model.config.vae_group_size = 1
 
         model.config.per_head_latent_size = 32
-        model.config.vae_hidden_size = 256
+        model.config.vae_hidden_size = 192  # 必须与训练一致
         model.config.logvar_min = -8.0
         model.config.logvar_max = -2.0
-        model.config.head_chunk_size = 1024
+        model.config.head_chunk_size = 256
 
-        # 混合使用原始 KV 与 VAE
+        # 可选混合策略
         model.config.use_kv_vae_hybrid = False
         model.config.kv_vae_keep_original_ratio = 0.5
         model.config.kv_vae_mix_seed = 42
         model.config.kv_vae_hybrid_prefill_only = False
         model.config.kv_vae_hybrid_decode_only = False
-
         model.config.kv_vae_debug = False
 
     model = model.eval()
