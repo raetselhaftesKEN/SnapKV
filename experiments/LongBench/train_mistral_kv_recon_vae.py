@@ -1345,7 +1345,7 @@ if __name__ == "__main__":
     main()
 
 '''
-PYTORCH_ALLOC_CONF=expandable_segments:True \
+nohup env PYTORCH_ALLOC_CONF=expandable_segments:True \
 python train_mistral_kv_recon_vae.py \
   --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
   --dataset_path Salesforce/wikitext \
@@ -1382,5 +1382,6 @@ python train_mistral_kv_recon_vae.py \
   --max_length 512 \
   --max_steps 2000 \
   --latent_stats_log_steps 10 \
-  --latent_hist_save_steps 100
+  --latent_hist_save_steps 100 \
+> vae_train_20250429.log 2>&1 &
 '''
