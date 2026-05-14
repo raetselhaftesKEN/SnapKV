@@ -133,40 +133,66 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
 if __name__ == "__main__":
     seed_everything(42)
     args = parse_args()
+    # world_size = torch.cuda.device_count()
+    # mp.set_start_method('spawn', force=True)
+
     model2path = json.load(open("config/model2path.json", "r"))
     model2maxlen = json.load(open("config/model2maxlen.json", "r"))
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model_name = args.model
+    # define your model
+    max_length = model2maxlen[model_name]
+    block_size = args.block_size
+    if args.e:
+        datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", \
+            "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+    else:
+        datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+            "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+            "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+
+    # check if args dataset in datasets
+    if args.dataset not in datasets:
+        raise ValueError(f"Dataset {args.dataset} not found in datasets")
+    # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
     dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
     dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
 
-    model_name = args.model
-    max_length = min(model2maxlen[model_name], 16384)
-    block_size = args.block_size
+    # 减小maxlen，以免OOM
+    max_length = min(max_length, 16384)
+
+    # predict on each dataset
+    if not os.path.exists("pred"):
+        os.makedirs("pred")
+    if not os.path.exists("pred_e"):
+        os.makedirs("pred_e")
     dataset = args.dataset
-    out_dir = "pred_e" if args.e else "pred"
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = f"{out_dir}/{model_name}/{dataset}.jsonl"
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    data = load_dataset('THUDM/LongBench', dataset+"_e" if args.e else dataset, split='test', trust_remote_code=True)
-    data_all = [x for x in data]
-    prompt_format = dataset2prompt[dataset]
-
-    compress_args = None
+    # for dataset in datasets:
     if args.compress_args_path:
         compress_args = json.load(open(os.path.join('config', args.compress_args_path), "r"))
+        compress = True
+        write_model_name = model_name + args.compress_args_path.split(".")[0]
         replace_llama()
         replace_mistral()
         replace_mixtral()
-
-    get_pred_single_gpu(
-        data_all,
-        max_length,
-        dataset2maxlen[dataset],
-        prompt_format,
-        dataset,
-        model_name,
-        model2path,
-        out_path,
-        compress=(compress_args is not None),
-        **(compress_args or {})
-    )
+    else:
+        compress = False
+        compress_args = None
+        write_model_name = model_name
+    if args.e:
+        data = load_dataset('THUDM/LongBench', f"{dataset}_e", split='test', trust_remote_code=True)
+        if not os.path.exists(f"pred_e/{write_model_name}"):
+            os.makedirs(f"pred_e/{write_model_name}")
+        out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"
+    else:
+        data = load_dataset('THUDM/LongBench', dataset, split='test', trust_remote_code=True)
+        if not os.path.exists(f"pred_e/{write_model_name}"):
+            os.makedirs(f"pred_e/{write_model_name}")
+        out_path = f"pred_e/{write_model_name}/{dataset}.jsonl"
+    prompt_format = dataset2prompt[dataset]
+    max_gen = dataset2maxlen[dataset]
+    data_all = [data_sample for data_sample in data]
+    if compress_args is not None:
+        get_pred_single_gpu(data_all, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, compress, **compress_args)
+    else:
+        get_pred_single_gpu(data_all, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, compress)
