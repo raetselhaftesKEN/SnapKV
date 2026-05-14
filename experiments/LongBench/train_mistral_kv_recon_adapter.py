@@ -153,8 +153,10 @@ def main():
                         n_heads=args.n_heads)
     adapter.train()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    adapter.to(device)
-    raw_model.to(device)
+    raw_model.to(device, dtype=torch.bfloat16)
+    for p in raw_model.parameters():
+        p.requires_grad = False
+    adapter.to(device, dtype=torch.bfloat16)
 
     # Dataset
     dataset = load_dataset(args.dataset_path, args.dataset_config_name, split="train")
