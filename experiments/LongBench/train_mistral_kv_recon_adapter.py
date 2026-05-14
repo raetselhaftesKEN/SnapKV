@@ -162,7 +162,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -210,7 +210,7 @@ nohup python train_mistral_kv_recon_adapter.py \
   --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
   --dataset_path Salesforce/wikitext \
   --text_column text \
-  --output_dir ./experiments/mistral_kv_crossattn \
+  --output_dir ./mistral_kv_crossattn \
   --block_size 512 \
   --batch_size 1 \
   --lr 2e-4 \
