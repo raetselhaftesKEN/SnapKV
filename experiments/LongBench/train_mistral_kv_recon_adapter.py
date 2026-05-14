@@ -143,6 +143,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--dataset_path", type=str, required=True)
+    parser.add_argument("--dataset_config_name", type=str, default=None)
     parser.add_argument("--text_column", type=str, default="text")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--block_size", type=int, default=512)
@@ -177,7 +178,8 @@ def main():
 
     # Dataset
     from datasets import load_dataset
-    dataset = load_dataset(args.dataset_path, split="train", streaming=False)
+    #dataset = load_dataset(args.dataset_path, split="train", streaming=False)
+    dataset = load_dataset(args.dataset_path, args.dataset_config_name, split="train", streaming=False)
     train_dataset = PackedTextIterableDataset(dataset, tokenizer, args.text_column, args.block_size)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=lambda x: lm_collator(x, tokenizer.pad_token_id))
 
@@ -209,6 +211,7 @@ if __name__ == "__main__":
 nohup python train_mistral_kv_recon_adapter.py \
   --model_name_or_path mistralai/mistral-7B-instruct-v0.2 \
   --dataset_path Salesforce/wikitext \
+  --dataset_config_name wikitext-103-raw-v1 \
   --text_column text \
   --output_dir ./mistral_kv_crossattn \
   --block_size 512 \
