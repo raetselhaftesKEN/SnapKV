@@ -297,21 +297,47 @@ def load_model_and_tokenizer(path, model_name, device, compress=False,
             f"method={cacheshrink_method}, dtype={cacheshrink_dtype}, "
             f"calibration={cacheshrink_use_calibration})"
         )
-        model, tokenizer = convert_to_mla(
-            path,
-            compression_ratio=cacheshrink_ratio,
-            compression_method=cacheshrink_method,
-            cross_layer_group_size=cacheshrink_group_size,
-            xkv_skip_early_layers=cacheshrink_skip_early_layers,
-            keep_early_layers_original=cacheshrink_keep_early_original,
-            device=device,
-            dtype=dtype,
-            use_calibration=cacheshrink_use_calibration,
-            num_calibration_samples=cacheshrink_calib_samples,
-            max_calibration_length=cacheshrink_calib_len,
-            store_original_weights=False,
-            verbose=cacheshrink_verbose,
-        )
+        # Some Mistral/LLaMA tokenizer.json files cannot be parsed by older
+        # tokenizers wheels when AutoTokenizer defaults to the fast tokenizer.
+        # CacheShrink internally calls AutoTokenizer.from_pretrained(), so we
+        # temporarily force use_fast=False only during convert_to_mla().
+        from transformers import AutoTokenizer as _HF_AutoTokenizer
+
+        _orig_from_pretrained = _HF_AutoTokenizer.from_pretrained
+
+        def _from_pretrained_force_slow(*args, **kwargs):
+            kwargs["use_fast"] = False
+            return _orig_from_pretrained(*args, **kwargs)
+
+        _HF_AutoTokenizer.from_pretrained = _from_pretrained_force_slow
+        try:
+            model, tokenizer = convert_to_mla(
+                path,
+                compression_ratio=cacheshrink_ratio,
+                compression_method=cacheshrink_method,
+                cross_layer_group_size=cacheshrink_group_size,
+                xkv_skip_early_layers=cacheshrink_skip_early_layers,
+                keep_early_layers_original=cacheshrink_keep_early_original,
+                device=device,
+                dtype=dtype,
+                use_calibration=cacheshrink_use_calibration,
+                num_calibration_samples=cacheshrink_calib_samples,
+                max_calibration_length=cacheshrink_calib_len,
+                store_original_weights=False,
+                verbose=cacheshrink_verbose,
+            )
+        finally:
+            _HF_AutoTokenizer.from_pretrained = _orig_from_pretrained
+
+        # Ensure the tokenizer used later in LongBench evaluation is also the
+        # slow tokenizer, matching the original SnapKV script's Mistral branch.
+        tokenizer_kwargs = {
+            "use_fast": False,
+            "trust_remote_code": ("chatglm" in model_name or "internlm" in model_name or "xgen" in model_name),
+        }
+        if "mistral" in model_name:
+            tokenizer_kwargs["padding_side"] = "right"
+        tokenizer = AutoTokenizer.from_pretrained(path, **tokenizer_kwargs)
         if "mistral" in model_name:
             tokenizer.padding_side = "right"
         model = model.eval()
