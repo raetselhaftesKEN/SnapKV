@@ -297,6 +297,12 @@ def get_pred_single_gpu(data, max_length, max_gen,
 
         def _run_generate(input_batch):
             cur_context_length = input_batch.input_ids.shape[-1]
+            # CacheShrink's current pip GenericWrapper can return None for HF legacy cache
+            # under transformers 4.37-style Mistral.  Force use_cache=False for the
+            # CacheShrink path so MistralModel.forward does not call
+            # next_decoder_cache.to_legacy_cache().  This is slower but much more stable
+            # for correctness/accuracy comparison.
+            generate_use_cache = False if use_cacheshrink else True
             if dataset == "samsum":
                 return model.generate(
                     **input_batch,
@@ -306,6 +312,7 @@ def get_pred_single_gpu(data, max_length, max_gen,
                     temperature=1.0,
                     min_length=cur_context_length + 1,
                     eos_token_id=[tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]],
+                    use_cache=generate_use_cache,
                 )[0], cur_context_length
             return model.generate(
                 **input_batch,
@@ -314,6 +321,7 @@ def get_pred_single_gpu(data, max_length, max_gen,
                 do_sample=False,
                 temperature=1.0,
                 min_length=cur_context_length + 1,
+                use_cache=generate_use_cache,
             )[0], cur_context_length
 
         try:
@@ -451,6 +459,15 @@ def load_model_and_tokenizer(path, model_name, device, compress=False,
             _HF_AutoTokenizer.from_pretrained = _orig_from_pretrained
 
         model = patch_cacheshrink_attention_return_abi(model)
+        # Avoid HF Mistral legacy-cache conversion crash with CacheShrink's current
+        # return ABI.  generate() also passes use_cache=False explicitly.
+        try:
+            model.config.use_cache = False
+            if hasattr(model, "generation_config") and model.generation_config is not None:
+                model.generation_config.use_cache = False
+            print("[CacheShrink] force use_cache=False for HF legacy-cache compatibility.")
+        except Exception as e:
+            print(f"[CacheShrink] warning: failed to set use_cache=False: {e}")
 
         # Ensure the tokenizer used later in LongBench evaluation is also the
         # slow tokenizer, matching the original SnapKV script's Mistral branch.
