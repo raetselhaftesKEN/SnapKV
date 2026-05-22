@@ -72,6 +72,71 @@ def str_to_torch_dtype(dtype_name: str):
     raise ValueError(f'Unsupported dtype: {dtype_name}')
 
 
+class CacheShrinkAttentionReturnAdapter(torch.nn.Module):
+    """Adapt CacheShrink attention output to older HF Mistral/LLaMA tuple ABI.
+
+    Some pip versions of cacheshrink return a 2-tuple from the replacement
+    attention module, while transformers==4.37-style MistralDecoderLayer expects
+    exactly:
+        attn_output, attn_weights, present_key_value
+
+    During generation `output_attentions=False` and `use_cache=True`, the second
+    value returned by CacheShrink is normally the new KV/latent cache.  Therefore
+    we map:
+        (attn_output, new_past) -> (attn_output, None, new_past)
+    This keeps generation compatible without changing CacheShrink internals.
+    """
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+    def forward(self, *args, **kwargs):
+        out = self.module(*args, **kwargs)
+        if isinstance(out, tuple) and len(out) == 2:
+            attn_output, second = out
+            output_attentions = bool(kwargs.get("output_attentions", False))
+            use_cache = bool(kwargs.get("use_cache", False))
+            if use_cache:
+                # HF decoder layer wants attn_weights in slot 2 and cache in slot 3.
+                return attn_output, None, second
+            # Non-cache path. If attentions were explicitly requested, preserve
+            # the second value as attn_weights; otherwise ignore it.
+            return attn_output, second if output_attentions else None, None
+        return out
+
+
+def patch_cacheshrink_attention_return_abi(model):
+    """Wrap converted attention modules if they return 2 values instead of 3."""
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        print("[CacheShrink ABI] model.model.layers not found; skip return-value adapter.")
+        return model
+
+    wrapped = 0
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        if isinstance(attn, CacheShrinkAttentionReturnAdapter):
+            continue
+        # Only wrap likely CacheShrink modules, so original/SnapKV attention is untouched.
+        mod_name = attn.__class__.__module__.lower()
+        cls_name = attn.__class__.__name__.lower()
+        if "cacheshrink" in mod_name or "mla" in cls_name:
+            layer.self_attn = CacheShrinkAttentionReturnAdapter(attn)
+            wrapped += 1
+
+    print(f"[CacheShrink ABI] wrapped {wrapped} attention modules for HF 3-tuple compatibility.")
+    return model
+
+
 # This is the customized building prompt for chat models
 def build_chat(tokenizer, prompt, model_name):
     if "chatglm3" in model_name:
@@ -353,6 +418,8 @@ def load_model_and_tokenizer(path, model_name, device, compress=False,
             )
         finally:
             _HF_AutoTokenizer.from_pretrained = _orig_from_pretrained
+
+        model = patch_cacheshrink_attention_return_abi(model)
 
         # Ensure the tokenizer used later in LongBench evaluation is also the
         # slow tokenizer, matching the original SnapKV script's Mistral branch.
