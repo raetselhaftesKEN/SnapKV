@@ -10,6 +10,7 @@ import os
 import json
 import random
 import argparse
+import gc
 
 import numpy as np
 import torch
@@ -57,8 +58,10 @@ def parse_args(args=None):
     parser.add_argument('--cacheshrink_verbose', action='store_true', help='Print CacheShrink conversion details')
     parser.add_argument('--max_eval_length', type=int, default=None,
                         help='Override LongBench input truncation length. Useful because CacheShrink MLA may use explicit attention and OOM on 16k contexts.')
-    parser.add_argument('--oom_retry_shrink', type=float, default=0.5,
-                        help='If CUDA OOM occurs during generation, retry once with input length multiplied by this ratio. Set <=0 to disable.')
+    parser.add_argument('--oom_retry_shrink', type=float, default=0.0,
+                        help='If CUDA OOM occurs during generation, retry once with input length multiplied by this ratio. Default 0 disables retry because CacheShrink explicit attention can leave CUDA state fragmented after OOM.')
+    parser.add_argument('--skip_oom_samples', action='store_true',
+                        help='If a sample still OOMs, write an empty prediction with oom=True and continue instead of crashing.')
     return parser.parse_args(args)
 
 
@@ -101,14 +104,12 @@ class CacheShrinkAttentionReturnAdapter(torch.nn.Module):
         out = self.module(*args, **kwargs)
         if isinstance(out, tuple) and len(out) == 2:
             attn_output, second = out
-            output_attentions = bool(kwargs.get("output_attentions", False))
-            use_cache = bool(kwargs.get("use_cache", False))
-            if use_cache:
-                # HF decoder layer wants attn_weights in slot 2 and cache in slot 3.
-                return attn_output, None, second
-            # Non-cache path. If attentions were explicitly requested, preserve
-            # the second value as attn_weights; otherwise ignore it.
-            return attn_output, second if output_attentions else None, None
+            # In tested CacheShrink GenericAttentionWrapper versions, the 2-tuple is
+            # (attn_output, new_past).  Older HF Mistral/LLaMA decoder layers require
+            # (attn_output, attn_weights, present_key_value).  Always preserve the
+            # second item as the cache; returning None here can later crash at
+            # next_decoder_cache.to_legacy_cache().
+            return attn_output, None, second
         return out
 
 
@@ -236,7 +237,8 @@ def get_pred_single_gpu(data, max_length, max_gen,
                         cacheshrink_calib_len=512,
                         cacheshrink_dtype='bfloat16',
                         cacheshrink_verbose=False,
-                        oom_retry_shrink=0.5):
+                        oom_retry_shrink=0.0,
+                        skip_oom_samples=False):
     model, tokenizer = load_model_and_tokenizer(
         model2path[model_name],
         model_name,
@@ -316,22 +318,51 @@ def get_pred_single_gpu(data, max_length, max_gen,
 
         try:
             output, decode_context_length = _run_generate(input)
-        except torch.OutOfMemoryError as e:
-            if oom_retry_shrink is None or oom_retry_shrink <= 0 or input.input_ids.shape[-1] <= 1024:
-                raise
+        except torch.OutOfMemoryError:
             old_len = input.input_ids.shape[-1]
-            new_len = max(1024, int(old_len * oom_retry_shrink))
-            print(f"[OOM] generation OOM at context_length={old_len}; retry with middle-truncated length={new_len}")
+            print(f"[OOM] generation OOM at context_length={old_len}")
+            gc.collect()
             torch.cuda.empty_cache()
-            half = new_len // 2
-            ids = input.input_ids[0]
-            short_ids = torch.cat([ids[:half], ids[-(new_len - half):]], dim=0).unsqueeze(0)
-            retry_input = {"input_ids": short_ids.to(device)}
-            if hasattr(input, "attention_mask") and input.attention_mask is not None:
-                retry_input["attention_mask"] = torch.ones_like(short_ids, device=device)
-            from transformers.tokenization_utils_base import BatchEncoding
-            retry_input = BatchEncoding(retry_input)
-            output, decode_context_length = _run_generate(retry_input)
+
+            output = None
+            decode_context_length = None
+
+            if oom_retry_shrink is not None and oom_retry_shrink > 0 and old_len > 512:
+                new_len = max(512, int(old_len * oom_retry_shrink))
+                print(f"[OOM] retry once with middle-truncated length={new_len}")
+                half = new_len // 2
+                ids = input.input_ids[0]
+                short_ids = torch.cat([ids[:half], ids[-(new_len - half):]], dim=0).unsqueeze(0)
+                retry_input = {"input_ids": short_ids.to(device)}
+                if hasattr(input, "attention_mask") and input.attention_mask is not None:
+                    retry_input["attention_mask"] = torch.ones_like(short_ids, device=device)
+                from transformers.tokenization_utils_base import BatchEncoding
+                retry_input = BatchEncoding(retry_input)
+                try:
+                    output, decode_context_length = _run_generate(retry_input)
+                except torch.OutOfMemoryError:
+                    print(f"[OOM] retry also failed at context_length={new_len}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+            if output is None:
+                if not skip_oom_samples:
+                    raise RuntimeError(
+                        "CacheShrink generation OOM. Re-run with a smaller --max_eval_length "
+                        "such as 1024 or 512, or add --skip_oom_samples to continue."
+                    )
+                pred = ""
+                with open(out_path, 'a', encoding='utf-8') as f:
+                    json.dump({
+                        "pred": pred,
+                        "answers": json_obj["answers"],
+                        "all_classes": json_obj["all_classes"],
+                        "length": json_obj["length"],
+                        "oom": True,
+                        "context_length": old_len,
+                    }, f, ensure_ascii=False)
+                    f.write('\n')
+                continue
 
         pred = tokenizer.decode(output[decode_context_length:], skip_special_tokens=True)
         pred = post_process(pred, model_name)
@@ -519,8 +550,8 @@ if __name__ == '__main__':
     if args.max_eval_length is not None:
         max_length = min(max_length, args.max_eval_length)
     elif args.use_cacheshrink:
-        # CacheShrink 对长上下文的显存开销通常高于原始 FlashAttention/SnapKV 路径；默认给一个保守值。
-        max_length = min(max_length, 4096)
+        # CacheShrink 当前 pip 版在该环境里会走显式 attention；24GB GPU 上 2k/4k 很容易 OOM，默认先用 1k 验证。
+        max_length = min(max_length, 1024)
     else:
         max_length = min(max_length, 16384)
     print(f"[Eval] max_length={max_length}")
@@ -579,6 +610,7 @@ if __name__ == '__main__':
         cacheshrink_dtype=args.cacheshrink_dtype,
         cacheshrink_verbose=args.cacheshrink_verbose,
         oom_retry_shrink=args.oom_retry_shrink,
+        skip_oom_samples=args.skip_oom_samples,
     )
 
     if compress_args is not None:
