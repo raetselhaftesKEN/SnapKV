@@ -164,5 +164,6 @@ experiments/LongBench/results
 experiments/LongBench/autorun*
 /.idea
 /cam-main
+/KIVI-main
 experiments/LongBench/run_train_mistral_kv_vae.sh
 /experiments/LongBench/results_vae
