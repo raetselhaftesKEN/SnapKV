@@ -9,6 +9,15 @@ import random
 import argparse
 import torch
 from snapkv.monkeypatch.monkeypatch import replace_llama, replace_mistral, replace_mixtral
+from snapkv.monkeypatch.snapkv_utils import (
+    collect_snapkv_kivi_cache_stats,
+    print_snapkv_kivi_cache_stats,
+)
+'''
+from snapkv.monkeypatch.snapkv_utils_kivi_comp_stats_cap import (
+    collect_snapkv_kivi_cache_stats,
+    print_snapkv_kivi_cache_stats,
+)'''
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -145,10 +154,17 @@ def get_pred_single_gpu(data, max_length, max_gen,
         pred = post_process(pred, model_name)
 
         torch.cuda.synchronize()
+        '''
         print(
             f"[MEM] allocated={torch.cuda.memory_allocated() / 1024 ** 2:.1f}MB | "
             f"reserved={torch.cuda.memory_reserved() / 1024 ** 2:.1f}MB | "
             f"max_alloc={torch.cuda.max_memory_allocated() / 1024 ** 2:.1f}MB"
+        )
+        '''
+        print_snapkv_kivi_cache_stats(
+            model,
+            every_layer=False,
+            prefix=f"[{dataset} sample {i}]"
         )
 
         with open(out_path, "a", encoding="utf-8") as f:
@@ -246,7 +262,18 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         model.config.snapkv_quant_dropped = True
         model.config.kivi_bits = 2
         model.config.kivi_group_size = 32
+
+        # KIVI 量化旁路最大容量
+        # -1：不限制
+        #  0：完全不保存 dropped token，相当于原始 SnapKV 丢弃
+        #  N：每层每 head 最多保留 N 个被 SnapKV 丢弃的 token，超出后丢弃最旧 dropped tokens
+        model.config.kivi_max_capacity = 4096
+
+        # OOM-safe chunk attention 的 chunk 大小
         model.config.snapkv_kivi_chunk_size = 256
+
+        # 是否在每层 forward 时打印统计；很啰嗦，一般建议 False
+        model.config.snapkv_kivi_print_stats = False
 
 
     elif "mixtral" in model_name:
