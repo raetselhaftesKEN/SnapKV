@@ -243,10 +243,10 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
             use_fast=False,
         )
 
-
         model.config.snapkv_quant_dropped = True
         model.config.kivi_bits = 2
         model.config.kivi_group_size = 32
+        model.config.snapkv_kivi_chunk_size = 256
 
 
     elif "mixtral" in model_name:
