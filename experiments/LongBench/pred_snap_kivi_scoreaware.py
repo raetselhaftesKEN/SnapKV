@@ -261,7 +261,7 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         # -1: 不限制
         #  0: 不保存 dropped token，相当于原始 SnapKV 丢弃
         #  N: 每层每 head 最多保存 N 个 quantized dropped token
-        model.config.kivi_total_token_budget = 8192
+        model.config.kivi_total_token_budget = 4096
 
         # OOM-safe decode chunk size
         model.config.snapkv_kivi_chunk_size = 256
