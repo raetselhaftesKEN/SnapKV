@@ -14,6 +14,61 @@ from snapkv.monkeypatch.snapkv_utils_scoreaware_kivi import (
     print_snapkv_kivi_cache_stats,
 )
 
+from transformers import AutoTokenizer
+from transformers.tokenization_utils import Trie
+
+def _rebuild_slow_tokenizer_trie(tokenizer):
+    """
+    修复 slow LlamaTokenizer 偶发 tokens_trie 状态异常的问题。
+    """
+    try:
+        trie = Trie()
+
+        if hasattr(tokenizer, "unique_no_split_tokens"):
+            for tok in tokenizer.unique_no_split_tokens:
+                if isinstance(tok, str) and len(tok) > 0:
+                    trie.add(tok)
+
+        if hasattr(tokenizer, "added_tokens_encoder"):
+            for tok in tokenizer.added_tokens_encoder.keys():
+                tok = str(tok)
+                if len(tok) > 0:
+                    trie.add(tok)
+
+        tokenizer.tokens_trie = trie
+    except Exception as e:
+        print(f"[Tokenizer Warning] Failed to rebuild slow tokenizer trie: {e}")
+
+    return tokenizer
+
+
+def load_tokenizer_safe(model_path):
+    """
+    优先使用 fast tokenizer；如果当前 tokenizers 版本无法解析 tokenizer.json，
+    自动回退到 slow tokenizer，并修复 slow tokenizer 的 tokens_trie。
+    """
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            use_fast=True,
+            trust_remote_code=True,
+        )
+        print("[Tokenizer] Loaded fast tokenizer.")
+        return tokenizer
+    except Exception as e:
+        print(f"[Tokenizer Warning] Fast tokenizer failed: {repr(e)}")
+        print("[Tokenizer] Falling back to slow tokenizer.")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        use_fast=False,
+        trust_remote_code=True,
+        legacy=False,
+    )
+    tokenizer = _rebuild_slow_tokenizer_trie(tokenizer)
+    print("[Tokenizer] Loaded slow tokenizer with rebuilt trie.")
+    return tokenizer
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None, choices=[
@@ -25,6 +80,29 @@ def parse_args(args=None):
     parser.add_argument('--dataset', type=str, default='qasper', help="Dataset to evaluate on")
     parser.add_argument('--block_size', type=int, default=64, help="Comp. block size")
     return parser.parse_args(args)
+
+def safe_tokenize(tokenizer, prompt, device):
+    if not isinstance(prompt, str):
+        prompt = str(prompt)
+
+    try:
+        return tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+    except TypeError as e:
+        msg = str(e)
+
+        # 只处理 slow tokenizer 的 Trie 异常，其他错误直接抛出
+        if "Trie" not in msg and "tokens_trie" not in msg:
+            raise
+
+        print("[Tokenizer Warning] Slow tokenizer Trie error detected. Rebuilding trie and retrying...")
+
+        try:
+            tokenizer = _rebuild_slow_tokenizer_trie(tokenizer)
+        except Exception as rebuild_e:
+            print(f"[Tokenizer Warning] Trie rebuild failed: {rebuild_e}")
+            raise e
+
+        return tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
 
 # This is the customized building prompt for chat models
 def build_chat(tokenizer, prompt, model_name):
@@ -121,7 +199,8 @@ def get_pred_single_gpu(data, max_length, max_gen,
         if "chatglm3" in model_name:
             input = prompt.to(device)
         else:
-            input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+            #input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+            input = safe_tokenize(tokenizer, prompt, device)
         context_length = input.input_ids.shape[-1]
         if not printed:
             print(prompt)
@@ -251,7 +330,7 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             padding_side="right",
-            use_fast=True,
+            use_fast=False,
         )
 
 
