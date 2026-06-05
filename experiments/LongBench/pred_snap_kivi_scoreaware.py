@@ -13,6 +13,7 @@ from snapkv.monkeypatch.snapkv_utils_scoreaware_kivi import (
     collect_snapkv_kivi_cache_stats,
     print_snapkv_kivi_cache_stats,
 )
+from snapkv.monkeypatch.tokenizer_slow_trie_safe import safe_tokenize, rebuild_slow_tokenizer_trie
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -121,7 +122,14 @@ def get_pred_single_gpu(data, max_length, max_gen,
         if "chatglm3" in model_name:
             input = prompt.to(device)
         else:
-            input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+            #input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+            input = safe_tokenize(
+                tokenizer,
+                prompt,
+                device=device,
+                truncation=False,
+                return_tensors="pt",
+            )
         context_length = input.input_ids.shape[-1]
         if not printed:
             print(prompt)
@@ -251,8 +259,13 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             padding_side="right",
-            use_fast=True,
+            use_fast=False,
         )
+
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = tokenizer.eos_token_id
+
+        rebuild_slow_tokenizer_trie(tokenizer)
 
 
         model.config.snapkv_quant_dropped = True
