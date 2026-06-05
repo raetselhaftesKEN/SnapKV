@@ -270,20 +270,12 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         model.config.kivi_tiers = [
             {
                 "name": "QLevel1",
-                "ratio": 0.5,
+                "ratio": 1,
                 "k_bits": 2,
                 "v_bits": 2,
                 "k_group_size": 32,
                 "v_group_size": 32,
-            },
-            {
-                "name": "QLevel2",
-                "ratio": 0.5,
-                "k_bits": 1,
-                "v_bits": 1,
-                "k_group_size": 64,
-                "v_group_size": 64,
-            },
+            }
         ]
 
         # 是否每层 forward 打印统计，通常保持 False
