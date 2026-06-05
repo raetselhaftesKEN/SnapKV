@@ -274,7 +274,7 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         # -1: 不限制
         #  0: 不保存 dropped token，相当于原始 SnapKV 丢弃
         #  N: 每层每 head 最多保存 N 个 quantized dropped token
-        model.config.kivi_total_token_budget = 4096
+        model.config.kivi_total_token_budget = 6164
 
         # OOM-safe decode chunk size
         model.config.snapkv_kivi_chunk_size = 256
@@ -283,12 +283,20 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         model.config.kivi_tiers = [
             {
                 "name": "QLevel1",
-                "ratio": 1,
+                "ratio": 0.75,
                 "k_bits": 2,
                 "v_bits": 2,
                 "k_group_size": 32,
                 "v_group_size": 32,
-            }
+            },
+            {
+                "name": "QLevel2",
+                "ratio": 0.25,
+                "k_bits": 1,
+                "v_bits": 1,
+                "k_group_size": 64,
+                "v_group_size": 64,
+            },
         ]
 
         # 是否每层 forward 打印统计，通常保持 False
