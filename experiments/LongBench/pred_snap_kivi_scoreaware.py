@@ -251,7 +251,7 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             padding_side="right",
-            use_fast=False,
+            use_fast=True,
         )
 
 
