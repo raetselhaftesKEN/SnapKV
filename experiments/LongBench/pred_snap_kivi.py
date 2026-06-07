@@ -8,8 +8,8 @@ import numpy as np
 import random
 import argparse
 import torch
-from snapkv.monkeypatch.monkeypatch import replace_llama, replace_mistral, replace_mixtral
-from snapkv.monkeypatch.snapkv_utils import (
+from snapkv.monkeypatch.monkeypatch_kivi import replace_llama, replace_mistral, replace_mixtral
+from snapkv.monkeypatch.snapkv_utils_kivi_comp_stats_cap import (
     collect_snapkv_kivi_cache_stats,
     print_snapkv_kivi_cache_stats,
 )
