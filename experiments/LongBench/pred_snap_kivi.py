@@ -275,8 +275,8 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             padding_side="right",
-            force_download=True, #每次都下载，以免污染出现Trie的问题
-            resume_download=False,
+            #force_download=True, #每次都下载，以免污染出现Trie的问题
+            #resume_download=False,
             use_fast=False,
         )
 
