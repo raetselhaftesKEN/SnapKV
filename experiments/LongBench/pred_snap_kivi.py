@@ -185,12 +185,10 @@ def get_pred_single_gpu(data, max_length, max_gen,
                 every_layer=False,
                 prefix=f"[{dataset} sample {i}]"
             )
-        else: # Trie_skip
-            pred = "unanswerable"
 
-        with open(out_path, "a", encoding="utf-8") as f:
-            json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
-            f.write('\n')
+            with open(out_path, "a", encoding="utf-8") as f:
+                json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
+                f.write('\n')
 
 
 def seed_everything(seed):
@@ -277,6 +275,8 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             padding_side="right",
+            force_download=True, #每次都下载，以免污染出现Trie的问题
+            resume_download=False,
             use_fast=False,
         )
 
