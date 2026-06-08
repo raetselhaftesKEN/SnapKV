@@ -9,7 +9,7 @@ from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb, r
 from transformers.utils import logging, is_flash_attn_2_available
 
 # Put snapkv_utils_kivi_comp.py under snapkv/monkeypatch/ and import from there.
-from snapkv.monkeypatch.snapkv_utils import init_snapkv, _tensor_nbytes, format_bytes
+from snapkv.monkeypatch.snapkv_utils_kivi_comp_stats_cap import init_snapkv, _tensor_nbytes, format_bytes
 
 logger = logging.get_logger(__name__)
 
