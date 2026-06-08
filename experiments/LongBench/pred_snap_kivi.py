@@ -126,24 +126,26 @@ def get_pred_single_gpu(data, max_length, max_gen,
 
                 trie_skip = True
 
-        if "chatglm3" in model_name:
-            tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=False).input_ids[0]
-        if len(tokenized_prompt) > max_length:
-            half = int(max_length/2)
-            prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-        if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: # chat models are better off without build prompts on these tasks
-            prompt = build_chat(tokenizer, prompt, model_name)
-        if "chatglm3" in model_name:
-            input = prompt.to(device)
-        else:
-            try:
-                input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
-            except TypeError as e:
-                if "Trie" in str(e):
-                    print(f"[Tokenizer Trie Error] dataset={dataset}, sample={i}, len(prompt)={len(prompt)}")
-                    print(prompt[:500])
-                    trie_skip = True
-            #input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+        if not trie_skip:
+            if "chatglm3" in model_name:
+                tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=False).input_ids[0]
+            if len(tokenized_prompt) > max_length:
+                half = int(max_length/2)
+                prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True)+tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+            if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: # chat models are better off without build prompts on these tasks
+                prompt = build_chat(tokenizer, prompt, model_name)
+            if "chatglm3" in model_name:
+                input = prompt.to(device)
+            else:
+                try:
+                    input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+                except TypeError as e:
+                    if "Trie" in str(e):
+                        print(f"[Tokenizer Trie Error] dataset={dataset}, sample={i}, len(prompt)={len(prompt)}")
+                        print(prompt[:500])
+                        trie_skip = True
+                #input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+
         if not trie_skip:
 
             context_length = input.input_ids.shape[-1]
