@@ -126,7 +126,15 @@ def get_pred_single_gpu(data, max_length, max_gen,
         if "chatglm3" in model_name:
             input = prompt.to(device)
         else:
-            input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+            try:
+                input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
+            except TypeError as e:
+                if "Trie" in str(e):
+                    print(f"[Tokenizer Trie Error] dataset={dataset}, sample={i}, len(prompt)={len(prompt)}")
+                    print(prompt[:500])
+                    continue
+                raise
+            #input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
         if not printed:
             print(prompt)
