@@ -116,17 +116,9 @@ def get_pred_single_gpu(data, max_length, max_gen,
         prompt = prompt_format.format(**json_obj)
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
 
-        trie_skip = False
         try:
             tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-        except TypeError as e:
-            if "Trie" in str(e):
-                print(f"[Tokenizer Trie Error] dataset={dataset}, sample={i}, len(prompt)={len(prompt)}")
-                print(prompt[:500])
 
-                trie_skip = True
-
-        if not trie_skip:
             if "chatglm3" in model_name:
                 tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=False).input_ids[0]
             if len(tokenized_prompt) > max_length:
@@ -143,10 +135,7 @@ def get_pred_single_gpu(data, max_length, max_gen,
                     if "Trie" in str(e):
                         print(f"[Tokenizer Trie Error] dataset={dataset}, sample={i}, len(prompt)={len(prompt)}")
                         print(prompt[:500])
-                        trie_skip = True
                 #input = tokenizer(prompt, truncation=False, return_tensors="pt").to(device)
-
-        if not trie_skip:
 
             context_length = input.input_ids.shape[-1]
             if not printed:
@@ -191,6 +180,12 @@ def get_pred_single_gpu(data, max_length, max_gen,
             with open(out_path, "a", encoding="utf-8") as f:
                 json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
                 f.write('\n')
+
+        except TypeError as e:
+            #if "Trie" in str(e):
+            print(f"[Error]\n****\nerr={e}\n****\n dataset={dataset}, sample={i}, len(prompt)={len(prompt)}")
+            #print(prompt[:500])
+
 
 
 def seed_everything(seed):
