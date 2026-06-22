@@ -297,8 +297,8 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         model.config.kivi_selection_mode = "score_recency"
 
         # score / newness 权重；代码内部会自动归一化
-        model.config.kivi_snap_score_weight = 0.5
-        model.config.kivi_recency_weight = 0.5
+        model.config.kivi_snap_score_weight = 1
+        model.config.kivi_recency_weight = 0
 
         # recency 曲线形状
         model.config.kivi_recency_power = 1.0
