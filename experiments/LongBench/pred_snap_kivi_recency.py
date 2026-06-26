@@ -362,10 +362,14 @@ def load_model_and_tokenizer(
     model = model.eval()
     return model, tokenizer
 
+import datetime
 
 if __name__ == '__main__':
     seed_everything(42)
     args = parse_args()
+
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
     # world_size = torch.cuda.device_count()
     # mp.set_start_method('spawn', force=True)
 
@@ -404,7 +408,7 @@ if __name__ == '__main__':
     if args.compress_args_path:
         compress_args = json.load(open(os.path.join('config', args.compress_args_path), "r"))
         compress = True
-        write_model_name = model_name + args.compress_args_path.split(".")[0]
+        write_model_name = model_name + args.compress_args_path.split(".")[0] + "_" + timestamp
         replace_llama()
         replace_mistral()
         replace_mixtral()
