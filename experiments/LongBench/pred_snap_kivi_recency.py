@@ -183,18 +183,14 @@ def get_pred_single_gpu(data, max_length, max_gen,
             pred = post_process(pred, model_name)
 
             torch.cuda.synchronize()
-            '''
-            print(
-                f"[MEM] allocated={torch.cuda.memory_allocated() / 1024 ** 2:.1f}MB | "
-                f"reserved={torch.cuda.memory_reserved() / 1024 ** 2:.1f}MB | "
-                f"max_alloc={torch.cuda.max_memory_allocated() / 1024 ** 2:.1f}MB"
-            )
-            '''
+
+            '''统计并打印kivi缓存状态（容量），每一次都要遍历整个缓存可能有同步问题，平常跑的时候要关掉
             print_snapkv_kivi_cache_stats(
                 model,
                 every_layer=False,
                 prefix=f"[{dataset} sample {i}]"
             )
+            '''
 
             with open(out_path, "a", encoding="utf-8") as f:
                 json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"],
