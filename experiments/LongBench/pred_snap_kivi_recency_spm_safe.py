@@ -131,10 +131,21 @@ def get_pred_single_gpu(data, max_length, max_gen,
                         max_capacity_prompts = None,
                         kernel_sizes = None,
                         pooling = None,
-                        block_size = 64):
+                        block_size = 64,
+                        kivi_snap_score_weight=None,
+                        kivi_recency_weight=None,
+                        kivi_recency_power=None):
     # device = torch.device(f'cuda:{rank}')
     # device = model.device
-    model, tokenizer = load_model_and_tokenizer(model2path[model_name], model_name, device = "cuda", compress=compress)
+    model, tokenizer = load_model_and_tokenizer(
+        model2path[model_name],
+        model_name,
+        device="cuda",
+        compress=compress,
+        kivi_snap_score_weight=kivi_snap_score_weight,
+        kivi_recency_weight=kivi_recency_weight,
+        kivi_recency_power=kivi_recency_power,
+    )
     device = model.device
     printed = False
     for sample_idx, json_obj in enumerate(tqdm(data)):
@@ -259,7 +270,15 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
-def load_model_and_tokenizer(path, model_name, device, compress=False):
+def load_model_and_tokenizer(
+        path,
+        model_name,
+        device,
+        compress=False,
+        kivi_snap_score_weight=None,
+        kivi_recency_weight=None,
+        kivi_recency_power=None,
+):
     if "chatglm" in model_name or "internlm" in model_name or "xgen" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
@@ -358,12 +377,17 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
         # 新选择器
         model.config.kivi_selection_mode = "score_recency"
 
-        # score / newness 权重；代码内部会自动归一化
-        model.config.kivi_snap_score_weight = 1
-        model.config.kivi_recency_weight = 0
-
-        # recency 曲线形状
-        model.config.kivi_recency_power = 1.0
+        # score / recency 参数：优先从 --compress_args_path 指定的 JSON 读取；
+        # 若 JSON 未提供对应字段，则保持这三个临时实验默认值。
+        model.config.kivi_snap_score_weight = (
+            0 if kivi_snap_score_weight is None else float(kivi_snap_score_weight)
+        )
+        model.config.kivi_recency_weight = (
+            1 if kivi_recency_weight is None else float(kivi_recency_weight)
+        )
+        model.config.kivi_recency_power = (
+            1.0 if kivi_recency_power is None else float(kivi_recency_power)
+        )
 
 
     elif "mixtral" in model_name:
@@ -395,11 +419,16 @@ def load_model_and_tokenizer(path, model_name, device, compress=False):
     model = model.eval()
     return model, tokenizer
 
+import datetime
+
 if __name__ == '__main__':
     seed_everything(42)
     args = parse_args()
     # world_size = torch.cuda.device_count()
     # mp.set_start_method('spawn', force=True)
+
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
 
     model2path = json.load(open("config/model2path.json", "r"))
     model2maxlen = json.load(open("config/model2maxlen.json", "r"))
@@ -436,7 +465,7 @@ if __name__ == '__main__':
     if args.compress_args_path:
         compress_args = json.load(open(os.path.join('config', args.compress_args_path), "r"))
         compress = True
-        write_model_name = model_name + args.compress_args_path.split(".")[0]
+        write_model_name = model_name + args.compress_args_path.split(".")[0]+ "_" + timestamp
         replace_llama()
         replace_mistral()
         replace_mixtral()
