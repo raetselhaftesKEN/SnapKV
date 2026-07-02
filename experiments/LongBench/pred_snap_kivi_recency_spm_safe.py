@@ -422,12 +422,14 @@ def load_model_and_tokenizer(
 import datetime
 
 if __name__ == '__main__':
-    seed_everything(42)
+    now = datetime.datetime.now()
+
+    seed_everything(int(now.timestamp()))
     args = parse_args()
     # world_size = torch.cuda.device_count()
     # mp.set_start_method('spawn', force=True)
 
-    now = datetime.datetime.now()
+
     timestamp = now.strftime("%Y%m%d_%H%M%S")
 
     model2path = json.load(open("config/model2path.json", "r"))
