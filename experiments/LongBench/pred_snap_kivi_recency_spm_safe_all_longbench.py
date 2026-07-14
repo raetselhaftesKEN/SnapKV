@@ -14,23 +14,28 @@ from snapkv.monkeypatch.snapkv_utils_kivi_score_recency import (
     collect_snapkv_kivi_cache_stats,
     print_snapkv_kivi_cache_stats,
 )
+
 '''
 from snapkv.monkeypatch.snapkv_utils_kivi_comp_stats_cap import (
     collect_snapkv_kivi_cache_stats,
     print_snapkv_kivi_cache_stats,
 )'''
 
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default=None, choices=[
-        "llama2-7b-chat-4k", "longchat-v1.5-7b-32k", "xgen-7b-8k", 
+        "llama2-7b-chat-4k", "longchat-v1.5-7b-32k", "xgen-7b-8k",
         "internlm-7b-8k", "chatglm2-6b", "chatglm2-6b-32k", "chatglm3-6b-32k", "vicuna-v1.5-7b-16k",
-        "mistral-7B-instruct-v0.2", "mistral-7B-instruct-v0.1", "llama-2-7B-32k-instruct", "mixtral-8x7B-instruct-v0.1","lwm-text-chat-1m", "lwm-text-1m"])
+        "mistral-7B-instruct-v0.2", "mistral-7B-instruct-v0.1", "llama-2-7B-32k-instruct", "mixtral-8x7B-instruct-v0.1",
+        "lwm-text-chat-1m", "lwm-text-1m"])
     parser.add_argument('--compress_args_path', type=str, default=None, help="Path to the compress args")
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
-    parser.add_argument('--dataset', type=str, default='all', help="Dataset to evaluate on. Use 'all' to evaluate all LongBench datasets.")
+    parser.add_argument('--dataset', type=str, default='all',
+                        help="Dataset to evaluate on. Use 'all' to evaluate all LongBench datasets.")
     parser.add_argument('--block_size', type=int, default=64, help="Comp. block size")
     return parser.parse_args(args)
+
 
 # This is the customized building prompt for chat models
 def build_chat(tokenizer, prompt, model_name):
@@ -47,7 +52,7 @@ def build_chat(tokenizer, prompt, model_name):
         conv.append_message(conv.roles[0], prompt)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
-    elif "llama2"  in model_name or "llama-2" in model_name or "lwm" in model_name:
+    elif "llama2" in model_name or "llama-2" in model_name or "lwm" in model_name:
         print('llama2', model_name)
         prompt = f"[INST]{prompt}[/INST]"
     elif "xgen" in model_name:
@@ -70,13 +75,13 @@ def build_chat(tokenizer, prompt, model_name):
         prompt = prompt
     return prompt
 
+
 def post_process(response, model_name):
     if "xgen" in model_name:
         response = response.strip().replace("Assistant:", "")
     elif "internlm" in model_name:
         response = response.split("<eoa>")[0]
     return response
-
 
 
 def _spm_encode_ids(tokenizer, text, add_special_tokens=True):
@@ -122,30 +127,37 @@ def _is_spm_safe_model(tokenizer, model_name):
         key in model_name for key in ("mistral", "mixtral", "llama", "longchat", "vicuna", "lwm")
     )
 
+
 @torch.inference_mode()
-def get_pred_single_gpu(data, max_length, max_gen, 
-                        prompt_format, dataset, model_name, 
-                        model2path, out_path, 
-                        compress=False, 
-                        window_sizes = None,
-                        max_capacity_prompts = None,
-                        kernel_sizes = None,
-                        pooling = None,
-                        block_size = 64,
+def get_pred_single_gpu(data, max_length, max_gen,
+                        prompt_format, dataset, model_name,
+                        model2path, out_path,
+                        compress=False,
+                        window_sizes=None,
+                        max_capacity_prompts=None,
+                        kernel_sizes=None,
+                        pooling=None,
+                        block_size=64,
                         kivi_snap_score_weight=None,
                         kivi_recency_weight=None,
-                        kivi_recency_power=None):
+                        kivi_recency_power=None,
+                        model=None,
+                        tokenizer=None):
     # device = torch.device(f'cuda:{rank}')
     # device = model.device
-    model, tokenizer = load_model_and_tokenizer(
-        model2path[model_name],
-        model_name,
-        device="cuda",
-        compress=compress,
-        kivi_snap_score_weight=kivi_snap_score_weight,
-        kivi_recency_weight=kivi_recency_weight,
-        kivi_recency_power=kivi_recency_power,
-    )
+    # When evaluating all LongBench datasets in one run, reuse one already-loaded model.
+    # Reloading with device_map="auto" after a previous dataset can make Accelerate offload
+    # some layers to CPU, while FlashAttention requires q/k/v to stay on CUDA.
+    if model is None or tokenizer is None:
+        model, tokenizer = load_model_and_tokenizer(
+            model2path[model_name],
+            model_name,
+            device="cuda",
+            compress=compress,
+            kivi_snap_score_weight=kivi_snap_score_weight,
+            kivi_recency_weight=kivi_recency_weight,
+            kivi_recency_power=kivi_recency_power,
+        )
     device = model.device
     printed = False
     for sample_idx, json_obj in enumerate(tqdm(data)):
@@ -169,7 +181,7 @@ def get_pred_single_gpu(data, max_length, max_gen,
                 # block size
                 model.model.layers[layer_idx].self_attn.config.block_size = block_size
         ############################################################################################################
-        
+
         prompt = prompt_format.format(**json_obj)
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
 
@@ -190,12 +202,15 @@ def get_pred_single_gpu(data, max_length, max_gen,
             else:
                 tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
                 if "chatglm3" in model_name:
-                    tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=False).input_ids[0]
+                    tokenized_prompt = \
+                    tokenizer(prompt, truncation=False, return_tensors="pt", add_special_tokens=False).input_ids[0]
                 if len(tokenized_prompt) > max_length:
                     half = int(max_length / 2)
-                    prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+                    prompt = tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + tokenizer.decode(
+                        tokenized_prompt[-half:], skip_special_tokens=True)
 
-            if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]: # chat models are better off without build prompts on these tasks
+            if dataset not in ["trec", "triviaqa", "samsum", "lsht", "lcc",
+                               "repobench-p"]:  # chat models are better off without build prompts on these tasks
                 prompt = build_chat(tokenizer, prompt, model_name)
 
             if "chatglm3" in model_name:
@@ -209,14 +224,14 @@ def get_pred_single_gpu(data, max_length, max_gen,
             if not printed:
                 print(prompt)
                 printed = True
-            if dataset == "samsum": # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
+            if dataset == "samsum":  # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
                 output = model.generate(
                     **input,
                     max_new_tokens=max_gen,
                     num_beams=1,
                     do_sample=False,
                     temperature=1.0,
-                    min_length=context_length+1,
+                    min_length=context_length + 1,
                     eos_token_id=[
                         tokenizer.eos_token_id,
                         (_spm_encode_ids(tokenizer, "\n", add_special_tokens=False)[-1]
@@ -231,7 +246,7 @@ def get_pred_single_gpu(data, max_length, max_gen,
                     num_beams=1,
                     do_sample=False,
                     temperature=1.0,
-                    min_length=context_length+1,
+                    min_length=context_length + 1,
                 )[0]
             pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
             pred = post_process(pred, model_name)
@@ -251,14 +266,14 @@ def get_pred_single_gpu(data, max_length, max_gen,
             )
 
             with open(out_path, "a", encoding="utf-8") as f:
-                json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"], "length": json_obj["length"]}, f, ensure_ascii=False)
+                json.dump({"pred": pred, "answers": json_obj["answers"], "all_classes": json_obj["all_classes"],
+                           "length": json_obj["length"]}, f, ensure_ascii=False)
                 f.write('\n')
 
         except TypeError as e:
-            #if "Trie" in str(e):
+            # if "Trie" in str(e):
             print(f"[Error]\n****\nerr={e}\n****\n dataset={dataset}, sample={sample_idx}, len(prompt)={len(prompt)}")
-            #print(prompt[:500])
-
+            # print(prompt[:500])
 
 
 def seed_everything(seed):
@@ -269,6 +284,7 @@ def seed_everything(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
+
 
 def load_model_and_tokenizer(
         path,
@@ -281,29 +297,30 @@ def load_model_and_tokenizer(
 ):
     if "chatglm" in model_name or "internlm" in model_name or "xgen" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(device)
+        model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, torch_dtype=torch.bfloat16).to(
+            device)
     elif "llama2" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path)
         model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(device)
     elif "longchat" in model_name or "vicuna" in model_name:
         if not compress:
             model = AutoModelForCausalLM.from_pretrained(
-                    path,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    use_cache=True,
-                    use_flash_attention_2=True
-                )
+                path,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                use_cache=True,
+                use_flash_attention_2=True
+            )
         else:
             model = AutoModelForCausalLM.from_pretrained(
-                    path,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    use_cache=True,
-                    use_flash_attention_2=True
-                )
+                path,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                use_cache=True,
+                use_flash_attention_2=True
+            )
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             use_fast=False,
@@ -311,22 +328,22 @@ def load_model_and_tokenizer(
     elif "llama-2" in model_name or "lwm" in model_name:
         if not compress:
             model = AutoModelForCausalLM.from_pretrained(
-                    path,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    use_cache=True,
-                    use_flash_attention_2=True
-                )
+                path,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                use_cache=True,
+                use_flash_attention_2=True
+            )
         else:
             model = AutoModelForCausalLM.from_pretrained(
-                    path,
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    use_cache=True,
-                    use_flash_attention_2=True
-                )
+                path,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                device_map="auto",
+                use_cache=True,
+                use_flash_attention_2=True
+            )
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             use_fast=False,
@@ -353,8 +370,8 @@ def load_model_and_tokenizer(
         tokenizer = AutoTokenizer.from_pretrained(
             path,
             padding_side="right",
-            #force_download=True, #每次都下载，以免污染出现Trie的问题
-            #resume_download=False,
+            # force_download=True, #每次都下载，以免污染出现Trie的问题
+            # resume_download=False,
             use_fast=False,
         )
 
@@ -419,6 +436,7 @@ def load_model_and_tokenizer(
     model = model.eval()
     return model, tokenizer
 
+
 import datetime
 
 if __name__ == '__main__':
@@ -428,7 +446,6 @@ if __name__ == '__main__':
     args = parse_args()
     # world_size = torch.cuda.device_count()
     # mp.set_start_method('spawn', force=True)
-
 
     timestamp = now.strftime("%Y%m%d_%H%M%S")
 
@@ -441,11 +458,11 @@ if __name__ == '__main__':
     block_size = args.block_size
     if args.e:
         datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", \
-            "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+                    "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
     else:
         datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
-            "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
-            "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
+                    "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
+                    "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
 
     # Select datasets. Default is 'all', so the original launch command evaluates the full LongBench suite.
     if args.dataset in [None, "all", "ALL", "longbench", "LongBench"]:
@@ -471,7 +488,7 @@ if __name__ == '__main__':
     if args.compress_args_path:
         compress_args = json.load(open(os.path.join('config', args.compress_args_path), "r"))
         compress = True
-        write_model_name = model_name + args.compress_args_path.split(".")[0]+ "_" + timestamp
+        write_model_name = model_name + args.compress_args_path.split(".")[0] + "_" + timestamp
         replace_llama()
         replace_mistral()
         replace_mixtral()
@@ -479,6 +496,29 @@ if __name__ == '__main__':
         compress = False
         compress_args = None
         write_model_name = model_name
+
+    # Load model/tokenizer only once and reuse them across all datasets.
+    # This avoids repeated device_map="auto" placement decisions after each dataset,
+    # which can otherwise offload layers to CPU and break FlashAttention with:
+    # RuntimeError: q must be on CUDA.
+    shared_model, shared_tokenizer = None, None
+    if compress_args is not None:
+        shared_model, shared_tokenizer = load_model_and_tokenizer(
+            model2path[model_name],
+            model_name,
+            device="cuda",
+            compress=compress,
+            kivi_snap_score_weight=compress_args.get("kivi_snap_score_weight", None),
+            kivi_recency_weight=compress_args.get("kivi_recency_weight", None),
+            kivi_recency_power=compress_args.get("kivi_recency_power", None),
+        )
+    else:
+        shared_model, shared_tokenizer = load_model_and_tokenizer(
+            model2path[model_name],
+            model_name,
+            device="cuda",
+            compress=compress,
+        )
 
     for dataset in eval_datasets:
         print(f"[LongBench] START dataset={dataset}", flush=True)
@@ -497,7 +537,32 @@ if __name__ == '__main__':
         max_gen = dataset2maxlen[dataset]
         data_all = [data_sample for data_sample in data]
         if compress_args is not None:
-            get_pred_single_gpu(data_all, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, compress, **compress_args)
+            get_pred_single_gpu(
+                data_all,
+                max_length,
+                max_gen,
+                prompt_format,
+                dataset,
+                model_name,
+                model2path,
+                out_path,
+                compress,
+                **compress_args,
+                model=shared_model,
+                tokenizer=shared_tokenizer,
+            )
         else:
-            get_pred_single_gpu(data_all, max_length, max_gen, prompt_format, dataset, model_name, model2path, out_path, compress)
+            get_pred_single_gpu(
+                data_all,
+                max_length,
+                max_gen,
+                prompt_format,
+                dataset,
+                model_name,
+                model2path,
+                out_path,
+                compress,
+                model=shared_model,
+                tokenizer=shared_tokenizer,
+            )
         print(f"[LongBench] DONE dataset={dataset} -> {out_path}", flush=True)
